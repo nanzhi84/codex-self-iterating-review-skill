@@ -1,0 +1,7 @@
+interface:
+  display_name: "Self Iterating Review"
+  short_description: "Fresh-context multi-round P1/P2 review loop"
+  default_prompt: "Use $self-iterating-review to review a scoped change set in fresh rounds, auto-fix current P1/P2 findings, run explicit tests, and stop when the scope is clean or the round limit is reached."
+
+policy:
+  allow_implicit_invocation: true
