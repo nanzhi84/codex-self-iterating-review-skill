@@ -13,6 +13,8 @@ const DEFAULT_MODE = "in-place";
 const DEFAULT_STOP_CONDITION = "current-clean";
 const DEFAULT_FOCUS = ["correctness", "regression", "security"];
 const DEFAULT_CODEX_TIMEOUT_MS = 180000;
+const WINDOWS_REVIEW_SANDBOX = "workspace-write";
+const DEFAULT_REVIEW_SANDBOX = "read-only";
 const LOG_PREFIX = "[self-iterating-review]";
 const OUTPUT_TAIL_LIMIT = 4000;
 
@@ -25,9 +27,22 @@ const REVIEW_SCHEMA_PATH = path.join(SCRIPT_DIR, "review-output.schema.json");
 const FIX_SCHEMA_PATH = path.join(SCRIPT_DIR, "fix-output.schema.json");
 const CODEX_INVOCATION = resolveCodexInvocation();
 
-main();
-
 function main() {
+  const context = {
+    runState: null,
+  };
+
+  try {
+    const finalReport = runLoop(context);
+    process.stdout.write(`${JSON.stringify(finalReport, null, 2)}\n`);
+  } catch (error) {
+    const failureReport = buildFailureReport(error, context.runState);
+    process.stdout.write(`${JSON.stringify(failureReport, null, 2)}\n`);
+    process.exitCode = 1;
+  }
+}
+
+function runLoop(context) {
   const config = parseArgs(process.argv.slice(2));
   ensureFileExists(REVIEW_SCHEMA_PATH, "Missing review schema");
   ensureFileExists(FIX_SCHEMA_PATH, "Missing fix schema");
@@ -71,6 +86,8 @@ function main() {
       fixSchema: FIX_SCHEMA_PATH,
     },
   };
+
+  context.runState = runState;
 
   log(`Run directory: ${runDir}`);
   log(`Target workspace: ${runState.targetCwd}`);
@@ -144,14 +161,8 @@ function main() {
   runState.finalStatus = deriveFinalStatus(runState.stopReason, runState.finalActiveFindings);
   finalizeFindingLedger(runState.allFindingsByFingerprint, runState.finalActiveFindings);
 
-  const finalReport = buildFinalReport(runState);
-  const finalJsonPath = path.join(runDir, "final-report.json");
-  const finalMarkdownPath = path.join(runDir, "final-report.md");
-  writeJson(finalJsonPath, finalReport);
-  fs.writeFileSync(finalMarkdownPath, buildMarkdownReport(finalReport), "utf8");
-
   log(`Finished with status '${runState.finalStatus}'.`);
-  log(`Final report: ${finalMarkdownPath}`);
+  return buildFinalReport(runState);
 }
 
 function parseArgs(argv) {
@@ -304,13 +315,15 @@ function runReviewRound({ config, roundNumber, roundDir, targetCwd }) {
   const prompt = buildReviewPrompt({ config, roundNumber, targetCwd });
   const parsed = runCodexStructured({
     cwd: targetCwd,
-    sandbox: "read-only",
+    sandbox: getReviewSandbox(),
     schemaPath: REVIEW_SCHEMA_PATH,
     outputPath,
     prompt,
     model: config.model,
     search: config.search,
     timeoutMs: config.codexTimeoutMs,
+    phase: "review",
+    roundNumber,
   });
 
   const findings = deduplicateFindings(
@@ -343,10 +356,14 @@ function runFixRound({ config, roundNumber, roundDir, targetCwd, activeFindings,
     model: config.model,
     search: config.search,
     timeoutMs: config.codexTimeoutMs,
+    phase: "fix",
+    roundNumber,
   });
 }
 
-function runCodexStructured({ cwd, sandbox, schemaPath, outputPath, prompt, model, search, timeoutMs }) {
+function runCodexStructured({ cwd, sandbox, schemaPath, outputPath, prompt, model, search, timeoutMs, phase, roundNumber }) {
+  const stdoutPath = outputPath.replace(/\.json$/i, ".stdout.log");
+  const stderrPath = outputPath.replace(/\.json$/i, ".stderr.log");
   const args = [
     ...CODEX_INVOCATION.baseArgs,
     "exec",
@@ -354,6 +371,8 @@ function runCodexStructured({ cwd, sandbox, schemaPath, outputPath, prompt, mode
     "--ephemeral",
     "--color",
     "never",
+    "-c",
+    "shell_environment_policy.use_profile=false",
     "-c",
     "mcp_servers={}",
     "-c",
@@ -384,11 +403,34 @@ function runCodexStructured({ cwd, sandbox, schemaPath, outputPath, prompt, mode
     timeout: timeoutMs,
   });
 
-  fs.writeFileSync(outputPath.replace(/\.json$/i, ".stdout.log"), result.stdout || "", "utf8");
-  fs.writeFileSync(outputPath.replace(/\.json$/i, ".stderr.log"), result.stderr || "", "utf8");
+  fs.writeFileSync(stdoutPath, result.stdout || "", "utf8");
+  fs.writeFileSync(stderrPath, result.stderr || "", "utf8");
 
   if (result.status !== 0) {
-    fail(`codex exec failed with exit code ${result.status}.\n${formatCommandFailure(result)}`);
+    fail(`codex exec failed during ${phase} round ${roundNumber}.`, {
+      errorType: "child_exec_failed",
+      phase,
+      round: roundNumber,
+      exitCode: result.status,
+      signal: result.signal ?? null,
+      stdoutPath,
+      stderrPath,
+      cwd,
+      sandbox,
+      commandFailure: formatCommandFailure(result),
+    });
+  }
+
+  if (!fs.existsSync(outputPath)) {
+    fail(`codex exec finished without writing structured output during ${phase} round ${roundNumber}.`, {
+      errorType: "missing_structured_output",
+      phase,
+      round: roundNumber,
+      stdoutPath,
+      stderrPath,
+      cwd,
+      sandbox,
+    });
   }
 
   const raw = fs.readFileSync(outputPath, "utf8");
@@ -396,7 +438,15 @@ function runCodexStructured({ cwd, sandbox, schemaPath, outputPath, prompt, mode
   try {
     return JSON.parse(raw);
   } catch (error) {
-    fail(`Failed to parse structured Codex output at ${outputPath}: ${error.message}\nRaw output:\n${truncate(raw)}`);
+    fail(`Failed to parse structured Codex output at ${outputPath}: ${error.message}`, {
+      errorType: "invalid_structured_output",
+      phase,
+      round: roundNumber,
+      stdoutPath,
+      stderrPath,
+      outputPath,
+      rawOutput: truncate(raw),
+    });
   }
 }
 
@@ -432,6 +482,7 @@ function buildReviewPrompt({ config, roundNumber, targetCwd }) {
     "- You may inspect repository context outside the scope, but only report findings whose root cause is inside the scope.",
     "- Report only current issues that are still present in this checkout.",
     "- Prefer high-confidence findings. Skip speculation.",
+    "- Do not run the full project test suite during the review round. Prefer static inspection and minimal targeted commands.",
     "- Deduplicate findings within this run.",
     "- Keep titles short and stable.",
     "- `fingerprint_basis` must be a terse and stable phrase describing the bug mechanism.",
@@ -564,6 +615,7 @@ function buildFinalReport(runState) {
   const allFindings = Array.from(runState.allFindingsByFingerprint.values()).sort(compareFindingEntries);
 
   return {
+    status: "completed",
     run_id: runState.runId,
     repo_name: runState.repoName,
     repo_root: runState.repoRoot,
@@ -600,87 +652,8 @@ function buildFinalReport(runState) {
       ...entry,
       currently_active: finalActiveFingerprints.has(entry.fingerprint),
     })),
-    artifact_paths: {
-      ...runState.artifactPaths,
-      final_report_json: path.join(runState.runDir, "final-report.json"),
-      final_report_markdown: path.join(runState.runDir, "final-report.md"),
-    },
+    artifact_paths: runState.artifactPaths,
   };
-}
-
-function buildMarkdownReport(report) {
-  const lines = [
-    "# Self Iterating Review Report",
-    "",
-    `- Run ID: \`${report.run_id}\``,
-    `- Final status: \`${report.final_status}\``,
-    `- Stop reason: \`${report.stop_reason}\``,
-    `- Rounds executed: \`${report.rounds_executed}\``,
-    `- Repo root: \`${report.repo_root}\``,
-    `- Target workspace: \`${report.target_cwd}\``,
-    `- Mode: \`${report.config.mode}\``,
-    `- Scope: ${report.config.scope}`,
-  ];
-
-  if (report.worktree_path) {
-    lines.push(`- Worktree path: \`${report.worktree_path}\``);
-  }
-
-  lines.push("", "## Baseline Tests", "");
-
-  if (report.baseline_tests.length === 0) {
-    lines.push("- No baseline tests were run.");
-  } else {
-    for (const test of report.baseline_tests) {
-      lines.push(`- \`${test.command}\`: ${test.status}`);
-    }
-  }
-
-  for (const round of report.rounds) {
-    lines.push("", `## Round ${round.round}`, "");
-    lines.push(`- Review summary: ${round.review_summary}`);
-    lines.push(`- Active P1/P2 findings: ${round.active_findings.length}`);
-    lines.push(`- New P1/P2 findings this round: ${round.new_findings.length}`);
-
-    if (round.fix) {
-      lines.push(`- Fix status: ${round.fix.status}`);
-      lines.push(`- Fix summary: ${round.fix.summary}`);
-    } else {
-      lines.push("- Fix status: not run");
-    }
-
-    if (round.tests.length === 0) {
-      lines.push("- Post-fix tests: not run");
-    } else {
-      for (const test of round.tests) {
-        lines.push(`- Post-fix test \`${test.command}\`: ${test.status}`);
-      }
-    }
-
-    if (round.active_findings.length > 0) {
-      lines.push("", "Active findings:");
-      for (const finding of round.active_findings) {
-        lines.push(`- [${finding.severity}] ${formatFindingLabel(finding)} - ${finding.why}`);
-      }
-    }
-  }
-
-  lines.push("", "## Remaining P1/P2 Findings", "");
-
-  if (report.remaining_findings.length === 0) {
-    lines.push("- None.");
-  } else {
-    for (const finding of report.remaining_findings) {
-      lines.push(`- [${finding.severity}] ${formatFindingLabel(finding)} - ${finding.why}`);
-    }
-  }
-
-  lines.push("", "## Artifacts", "");
-  lines.push(`- JSON report: \`${report.artifact_paths.final_report_json}\``);
-  lines.push(`- Markdown report: \`${report.artifact_paths.final_report_markdown}\``);
-  lines.push(`- Run directory: \`${report.artifact_paths.runDir}\``);
-
-  return `${lines.join("\n")}\n`;
 }
 
 function deriveFinalStatus(stopReason, finalActiveFindings) {
@@ -778,10 +751,51 @@ function serializeFindingForReport(finding) {
 
 function formatFindingLabel(finding) {
   const location = finding.file
-    ? `${finding.file}${finding.line_start ? `:${finding.line_start}` : ""}`
+    ? `${finding.file}${finding.lineStart ? `:${finding.lineStart}` : ""}`
     : "unknown location";
 
   return `${finding.title} (${location})`;
+}
+
+function buildFailureReport(error, runState) {
+  const details = error instanceof SelfIteratingReviewError ? error.details : {};
+
+  return {
+    status: "failed",
+    run_id: runState?.runId ?? null,
+    repo_name: runState?.repoName ?? null,
+    repo_root: runState?.repoRoot ?? null,
+    target_cwd: runState?.targetCwd ?? null,
+    worktree_path: runState?.worktreePath ?? null,
+    final_status: "failed",
+    stop_reason: "failed",
+    rounds_executed: runState?.rounds.length ?? 0,
+    phase: details.phase ?? null,
+    round: details.round ?? null,
+    error_type: details.errorType || "runtime_error",
+    message: error instanceof Error ? error.message : String(error),
+    exit_code: details.exitCode ?? null,
+    signal: details.signal ?? null,
+    cwd: details.cwd ?? null,
+    sandbox: details.sandbox ?? null,
+    artifact_paths: {
+      ...(runState?.artifactPaths ?? {}),
+      stdout_log: details.stdoutPath ?? null,
+      stderr_log: details.stderrPath ?? null,
+      structured_output: details.outputPath ?? null,
+    },
+    baseline_tests: runState?.baselineTests ?? [],
+    rounds: runState?.rounds.map((roundRecord) => ({
+      round: roundRecord.round,
+      review_summary: roundRecord.review.roundSummary,
+      active_findings: roundRecord.activeFindings.map(serializeFindingForReport),
+      new_findings: roundRecord.newFindings.map(serializeFindingForReport),
+      fix: roundRecord.fix,
+      tests: roundRecord.tests,
+    })) ?? [],
+    command_failure: details.commandFailure ?? null,
+    raw_output: details.rawOutput ?? null,
+  };
 }
 
 function normalizeFilePath(filePath, repoRoot) {
@@ -869,6 +883,10 @@ function runProcess(command, args, options = {}) {
   });
 }
 
+function getReviewSandbox() {
+  return process.platform === "win32" ? WINDOWS_REVIEW_SANDBOX : DEFAULT_REVIEW_SANDBOX;
+}
+
 function resolveCodexInvocation() {
   if (process.platform !== "win32") {
     return {
@@ -945,10 +963,19 @@ function formatCommandFailure(result) {
 }
 
 function log(message) {
-  process.stdout.write(`${LOG_PREFIX} ${message}\n`);
+  process.stderr.write(`${LOG_PREFIX} ${message}\n`);
 }
 
-function fail(message) {
-  process.stderr.write(`${LOG_PREFIX} ${message}\n`);
-  process.exit(1);
+function fail(message, details = {}) {
+  throw new SelfIteratingReviewError(message, details);
 }
+
+class SelfIteratingReviewError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = "SelfIteratingReviewError";
+    this.details = details;
+  }
+}
+
+main();

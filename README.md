@@ -92,8 +92,8 @@ Typical artifacts include:
 - per-round review stdout/stderr logs
 - per-round structured review output
 - per-round structured fix output
-- final `final-report.json`
-- final `final-report.md`
+- final structured JSON printed to stdout
+- artifact paths that point back to the per-run debug directory
 
 ## Design Notes
 

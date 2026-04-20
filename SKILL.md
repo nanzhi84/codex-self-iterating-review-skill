@@ -17,6 +17,8 @@ node "<skill-dir>/scripts/review_loop.mjs"
 
 Resolve `<skill-dir>` to the installed directory of this skill, then run the bundled script from there. The script uses `codex exec --ephemeral`, so each review run starts with a fresh Codex context instead of reusing the current thread.
 
+On Windows, the supervisor also disables PowerShell profile loading for child `codex exec` runs so local `profile.ps1` customizations do not break the loop.
+
 ## Required Inputs
 
 Collect or confirm only these inputs:
@@ -59,7 +61,7 @@ Ignore style feedback, refactors, polish, and speculative concerns. Those belong
 3. Choose `--mode in-place` or `--mode worktree`.
 4. Pass every explicit test command with its own `--test`.
 5. Run the script.
-6. Read the generated `final-report.md` and summarize:
+6. Read the final JSON printed to stdout and summarize:
    - why the loop stopped
    - how many rounds ran
    - which `P1/P2` findings were fixed
@@ -95,12 +97,11 @@ If the user explicitly approves skipping tests, add `--allow-no-tests`.
 
 ## Output Expectations
 
-The script writes all artifacts under `~/.codex/tmp/self-iterating-review/...` and never writes reports into the repository. The final report includes the run configuration, per-round review and fix summaries, test results, remaining `P1/P2` findings, and the artifact paths.
+The script writes per-round debug artifacts under `~/.codex/tmp/self-iterating-review/...` and never writes reports into the repository. The final result is printed to stdout as JSON and includes the run configuration, per-round review and fix summaries, test results, remaining `P1/P2` findings, and the artifact paths.
 
 When the script finishes:
 
-- read `final-report.md`
-- mention the report path in your summary
+- read the final stdout JSON
 - mention the worktree path when `worktree` mode was used
 - do not create extra documentation files in the repository
 
