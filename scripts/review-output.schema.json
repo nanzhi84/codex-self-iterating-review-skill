@@ -4,7 +4,8 @@
   "additionalProperties": false,
   "required": [
     "round_summary",
-    "findings"
+    "findings",
+    "business_questions"
   ],
   "properties": {
     "round_summary": {
@@ -26,7 +27,9 @@
           "why",
           "repro_or_evidence",
           "fix_strategy",
-          "fingerprint_basis"
+          "fingerprint_basis",
+          "requires_business_confirmation",
+          "business_question"
         ],
         "properties": {
           "severity": {
@@ -85,6 +88,51 @@
           "fingerprint_basis": {
             "type": "string",
             "minLength": 1
+          },
+          "requires_business_confirmation": {
+            "type": "boolean"
+          },
+          "business_question": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "business_questions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "title",
+          "file",
+          "question",
+          "blocked_findings"
+        ],
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "file": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "question": {
+            "type": "string",
+            "minLength": 1
+          },
+          "blocked_findings": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
           }
         }
       }
