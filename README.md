@@ -52,9 +52,9 @@ Clone or copy this directory into your Codex skills directory:
 
 After installation, Codex can trigger the skill from natural language requests such as:
 
-- `开始自我迭代review`
-- `循环review这个范围`
-- `用 fresh-context review 直到没有可修复 findings`
+- `Start a self-iterating review for this branch.`
+- `Review this scoped change set in fresh rounds until it is clean.`
+- `Use fresh-context review to fix concrete findings and stop if business confirmation is needed.`
 
 ## Usage
 
