@@ -34,6 +34,8 @@ const REVIEW_SCHEMA_PATH = path.join(SCRIPT_DIR, "review-output.schema.json");
 const FIX_SCHEMA_PATH = path.join(SCRIPT_DIR, "fix-output.schema.json");
 const CODEX_INVOCATION = resolveCodexInvocation();
 const CODEX_EXEC_CAPABILITIES = detectCodexExecCapabilities();
+let windowsTestShell = null;
+let searchFlagWarningPrinted = false;
 
 async function main() {
   const context = {
@@ -297,7 +299,7 @@ function printHelp() {
     "  --extra-instruction <text>  Extra instruction for review and fix prompts",
     "  --model <name>              Optional model override for codex exec",
     `  --codex-timeout-ms <ms>     Per-run timeout for codex exec (default: ${DEFAULT_CODEX_TIMEOUT_MS})`,
-    "  --search                    Enable live web search in codex exec (default: enabled)",
+    "  --search                    Request live web search in codex exec when supported (default: requested)",
     "  --allow-no-tests            Skip the explicit test requirement",
     "  --plan-only                 Print the resolved base + auto-slice plan without launching Codex",
   ];
@@ -506,6 +508,7 @@ async function runReviewRound({
   previousFailedTests,
 }) {
   const outputPath = path.join(roundDir, "review-output.json");
+  const initialWorkspaceSnapshot = getGitWorkspaceSnapshot(targetCwd);
   const prompt = buildReviewPrompt({
     config,
     slice,
@@ -513,9 +516,8 @@ async function runReviewRound({
     globalRoundNumber,
     previousFailedTests,
   });
-  const parsed = await runCodexStructured({
+  const parsed = await runReviewCodexStructured({
     cwd: targetCwd,
-    sandbox: getReviewSandbox(),
     schemaPath: REVIEW_SCHEMA_PATH,
     outputPath,
     prompt,
@@ -523,6 +525,10 @@ async function runReviewRound({
     search: config.search,
     timeoutMs: config.codexTimeoutMs,
     phase: "review",
+    roundNumber,
+  });
+  assertReviewDidNotModifyWorkspace(targetCwd, initialWorkspaceSnapshot, {
+    outputPath,
     roundNumber,
   });
 
@@ -593,9 +599,17 @@ async function runCodexStructured({
 }) {
   const stdoutPath = outputPath.replace(/\.json$/i, ".stdout.log");
   const stderrPath = outputPath.replace(/\.json$/i, ".stderr.log");
+  const searchFlagPosition = search ? CODEX_EXEC_CAPABILITIES.searchFlagPosition : null;
+
+  if (search && !searchFlagPosition) {
+    warnSearchFlagUnsupported();
+  }
+
   const args = [
     ...CODEX_INVOCATION.baseArgs,
+    ...(searchFlagPosition === "global" ? ["--search"] : []),
     "exec",
+    ...(searchFlagPosition === "exec" ? ["--search"] : []),
     "-",
     "--ephemeral",
     "--color",
@@ -624,17 +638,6 @@ async function runCodexStructured({
 
   if (model) {
     args.push("--model", model);
-  }
-
-  if (search && CODEX_EXEC_CAPABILITIES.supportsSearchFlag) {
-    args.push("--search");
-  } else if (search) {
-    fail("Live web search is required, but the local `codex exec` does not support `--search`.", {
-      errorType: "search_not_supported",
-      phase,
-      round: roundNumber,
-      cwd,
-    });
   }
 
   const result = await runProcessAsync(CODEX_INVOCATION.command, args, {
@@ -703,6 +706,27 @@ async function runCodexStructured({
       stderrPath,
       outputPath,
       rawOutput: truncate(raw),
+    });
+  }
+}
+
+async function runReviewCodexStructured(options) {
+  const sandbox = getReviewSandbox();
+
+  try {
+    return await runCodexStructured({
+      ...options,
+      sandbox,
+    });
+  } catch (error) {
+    if (!shouldRetryReviewWithWorkspaceWrite(error, sandbox)) {
+      throw error;
+    }
+
+    log("Read-only review sandbox failed on Windows; retrying with workspace-write and enforcing a post-review dirty check.");
+    return runCodexStructured({
+      ...options,
+      sandbox: WINDOWS_REVIEW_SANDBOX,
     });
   }
 }
@@ -1226,9 +1250,10 @@ function normalizeFilePath(filePath, repoRoot) {
 
   const absoluteCandidate = path.isAbsolute(trimmed) ? trimmed : path.resolve(repoRoot, trimmed);
   const normalized = path.normalize(absoluteCandidate);
+  const relative = path.relative(repoRoot, normalized);
 
-  if (normalized.startsWith(path.normalize(repoRoot))) {
-    return toPosixPath(path.relative(repoRoot, normalized));
+  if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
+    return relative === "" ? "." : toPosixPath(relative);
   }
 
   return toPosixPath(trimmed);
@@ -1759,9 +1784,88 @@ function getGitStatus(cwd) {
   return result.stdout;
 }
 
+function getGitWorkspaceSnapshot(cwd) {
+  return {
+    status: getGitStatus(cwd),
+    unstagedDiff: getGitDiffSnapshot(cwd, []),
+    stagedDiff: getGitDiffSnapshot(cwd, ["--cached"]),
+    untrackedFiles: getUntrackedFileSnapshots(cwd),
+  };
+}
+
+function getGitDiffSnapshot(cwd, extraArgs) {
+  const result = runProcess("git", ["diff", "--binary", ...extraArgs], {
+    cwd,
+  });
+
+  if (result.status !== 0) {
+    fail(`Failed to read git diff in ${cwd}.\n${formatCommandFailure(result)}`);
+  }
+
+  return result.stdout;
+}
+
+function getUntrackedFileSnapshots(cwd) {
+  const result = runProcess("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
+    cwd,
+  });
+
+  if (result.status !== 0) {
+    fail(`Failed to list untracked files in ${cwd}.\n${formatCommandFailure(result)}`);
+  }
+
+  return result.stdout
+    .split("\0")
+    .filter(Boolean)
+    .sort((left, right) => left.localeCompare(right))
+    .map((relativePath) => getUntrackedFileSnapshot(cwd, relativePath));
+}
+
+function getUntrackedFileSnapshot(cwd, relativePath) {
+  const absolutePath = path.resolve(cwd, relativePath);
+  const relativeFromRoot = path.relative(cwd, absolutePath);
+
+  if (relativeFromRoot.startsWith("..") || path.isAbsolute(relativeFromRoot)) {
+    fail(`Refusing to snapshot untracked path outside the repository: ${relativePath}`, {
+      errorType: "untracked_path_outside_repo",
+      cwd,
+      path: relativePath,
+    });
+  }
+
+  const stat = fs.lstatSync(absolutePath);
+  if (stat.isSymbolicLink()) {
+    return {
+      path: toPosixPath(relativePath),
+      type: "symlink",
+      target: fs.readlinkSync(absolutePath),
+    };
+  }
+
+  if (stat.isFile()) {
+    return {
+      path: toPosixPath(relativePath),
+      type: "file",
+      size: stat.size,
+      hash: hashFile(absolutePath),
+    };
+  }
+
+  return {
+    path: toPosixPath(relativePath),
+    type: "other",
+    size: stat.size,
+  };
+}
+
+function hashFile(filePath) {
+  return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+}
+
 function runShellCommand(command, cwd) {
   if (process.platform === "win32") {
-    return runProcess("powershell", ["-NoLogo", "-NoProfile", "-Command", command], { cwd });
+    const shell = getWindowsTestShell();
+    return runProcess(shell.command, [...shell.args, command], { cwd });
   }
 
   return runProcess("/bin/sh", ["-lc", command], { cwd });
@@ -1899,7 +2003,16 @@ function terminateProcessTree(child, options = {}) {
 }
 
 function getReviewSandbox() {
-  return process.platform === "win32" ? WINDOWS_REVIEW_SANDBOX : DEFAULT_REVIEW_SANDBOX;
+  return DEFAULT_REVIEW_SANDBOX;
+}
+
+function warnSearchFlagUnsupported() {
+  if (searchFlagWarningPrinted) {
+    return;
+  }
+
+  searchFlagWarningPrinted = true;
+  log("Local Codex CLI does not expose a supported `--search` flag position; continuing without passing that flag.");
 }
 
 function resolveCodexInvocation() {
@@ -1917,7 +2030,14 @@ function resolveCodexInvocation() {
 }
 
 function detectCodexExecCapabilities() {
-  const result = runProcess(
+  const globalHelpResult = runProcess(
+    CODEX_INVOCATION.command,
+    [...CODEX_INVOCATION.baseArgs, "--help"],
+    {
+      cwd: process.cwd(),
+    },
+  );
+  const execHelpResult = runProcess(
     CODEX_INVOCATION.command,
     [...CODEX_INVOCATION.baseArgs, "exec", "--help"],
     {
@@ -1925,11 +2045,100 @@ function detectCodexExecCapabilities() {
     },
   );
 
-  const helpText = `${result.stdout || ""}\n${result.stderr || ""}`;
+  const globalHelpText = `${globalHelpResult.stdout || ""}\n${globalHelpResult.stderr || ""}`;
+  const execHelpText = `${execHelpResult.stdout || ""}\n${execHelpResult.stderr || ""}`;
+  const supportsGlobalSearchFlag = hasHelpFlag(globalHelpText, "--search");
+  const supportsExecSearchFlag = hasHelpFlag(execHelpText, "--search");
+  const searchFlagPosition = supportsGlobalSearchFlag
+    ? "global"
+    : supportsExecSearchFlag
+      ? "exec"
+      : null;
 
   return {
-    supportsSearchFlag: /\B--search\b/.test(helpText),
+    supportsSearchFlag: Boolean(searchFlagPosition),
+    supportsGlobalSearchFlag,
+    supportsExecSearchFlag,
+    searchFlagPosition,
   };
+}
+
+function hasHelpFlag(helpText, flagName) {
+  const escapedFlag = flagName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[\\s,])${escapedFlag}(?=[\\s,])`).test(helpText);
+}
+
+function getWindowsTestShell() {
+  if (windowsTestShell) {
+    return windowsTestShell;
+  }
+
+  if (commandExistsOnWindows("pwsh.exe")) {
+    windowsTestShell = {
+      command: "pwsh",
+      args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"],
+    };
+    return windowsTestShell;
+  }
+
+  if (commandExistsOnWindows("powershell.exe")) {
+    windowsTestShell = {
+      command: "powershell",
+      args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"],
+    };
+    return windowsTestShell;
+  }
+
+  fail("Windows test commands require either `pwsh.exe` or `powershell.exe` on PATH.", {
+    errorType: "missing_windows_shell",
+  });
+}
+
+function commandExistsOnWindows(command) {
+  if (process.platform !== "win32") {
+    return false;
+  }
+
+  const result = runProcess("where.exe", [command]);
+  return result.status === 0;
+}
+
+function shouldRetryReviewWithWorkspaceWrite(error, sandbox) {
+  if (process.platform !== "win32" || sandbox !== DEFAULT_REVIEW_SANDBOX) {
+    return false;
+  }
+
+  if (!(error instanceof SelfIteratingReviewError)) {
+    return false;
+  }
+
+  if (error.details?.errorType !== "child_exec_failed") {
+    return false;
+  }
+
+  const failureText = `${error.message}\n${error.details?.commandFailure || ""}`;
+  return /\bsandbox\b|read[- ]only|not supported|unsupported/i.test(failureText);
+}
+
+function assertReviewDidNotModifyWorkspace(cwd, initialWorkspaceSnapshot, { outputPath, roundNumber }) {
+  const finalWorkspaceSnapshot = getGitWorkspaceSnapshot(cwd);
+  if (JSON.stringify(finalWorkspaceSnapshot) === JSON.stringify(initialWorkspaceSnapshot)) {
+    return;
+  }
+
+  fail("Review round modified the working tree; review runs must leave the checkout unchanged.", {
+    errorType: "review_modified_workspace",
+    phase: "review",
+    round: roundNumber,
+    cwd,
+    outputPath,
+    commandFailure: [
+      "git status before review:",
+      initialWorkspaceSnapshot.status.trim() || "(clean)",
+      "git status after review:",
+      finalWorkspaceSnapshot.status.trim() || "(clean)",
+    ].join("\n"),
+  });
 }
 
 function validateTestCommandsForTargetWorkspace(commands, { mode, repoRoot, targetCwd }) {

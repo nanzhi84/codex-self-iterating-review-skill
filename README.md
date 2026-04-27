@@ -10,8 +10,10 @@ The repository contains two layers:
 ## What It Does
 
 - Runs review rounds in fresh non-interactive Codex sessions.
+- Requests live web search using the flag position supported by the installed Codex CLI.
 - Fixes concrete `P1` through `P4` findings.
 - Stops and reports questions when a finding depends on unclear business semantics.
+- Keeps review rounds read-only by default; if Windows requires a writable sandbox, the supervisor checks a Git workspace snapshot afterward.
 - Supports `auto`, `in-place`, and detached `worktree` mode.
 - Defaults to `auto`: use the current checkout when it is already a linked worktree or has uncommitted changes, otherwise create a detached worktree for a clean main checkout.
 - Creates a handoff commit in `worktree` mode when fixes are made.
@@ -39,6 +41,7 @@ self-iterating-review/
 - Node.js 18+
 - Git
 - A Git repository to review
+- PowerShell 7 (`pwsh`) is recommended on Windows; Windows PowerShell is used as a fallback.
 
 If `codex exec` is not healthy, the loop will fail before the first review round. In practice the most common blocker is stale local authentication. If the logs mention `invalid_grant`, `TokenRefreshFailed`, or similar auth errors, re-authenticate Codex CLI first and retry.
 
@@ -58,7 +61,7 @@ After installation, Codex can trigger the skill from natural language requests s
 
 ## Usage
 
-Run the supervisor directly:
+Run the supervisor directly. This example uses PowerShell line continuation:
 
 ```powershell
 node "<skill-dir>/scripts/review_loop.mjs" `
@@ -67,6 +70,18 @@ node "<skill-dir>/scripts/review_loop.mjs" `
   --test "pnpm test" `
   --test "pnpm lint" `
   --mode "auto" `
+  --max-rounds "6"
+```
+
+On macOS or Linux, use shell line continuation instead:
+
+```bash
+node "<skill-dir>/scripts/review_loop.mjs" \
+  --scope "Review the current branch diff against origin/main for concrete correctness, regression, and security defects." \
+  --path "src" \
+  --test "pnpm test" \
+  --test "pnpm lint" \
+  --mode "auto" \
   --max-rounds "6"
 ```
 
@@ -80,7 +95,7 @@ node "<skill-dir>/scripts/review_loop.mjs" `
 - `--stop-condition current-clean|no-new-p1p2`: choose the stop rule
 - `--allow-no-tests`: allow a no-test run only when explicitly desired
 - `--codex-timeout-ms`: per-run timeout for each fresh Codex session
-- `--search`: live web search is enabled by default in child `codex exec` runs; the run fails if the local CLI cannot support it
+- `--search`: request live web search when the installed Codex CLI exposes a supported flag position
 
 ## Output
 
@@ -103,5 +118,7 @@ Typical artifacts include:
 ## Design Notes
 
 The core requirement behind this skill is not “review repeatedly” in the same thread. It is “review repeatedly with bounded machine state and fresh model context”. That is why the loop keeps state outside Codex conversation memory and re-enters Codex through `codex exec --ephemeral` on every round.
+
+Review runs are expected to inspect code without changing it. The supervisor compares the workspace before and after review using staged and unstaged diffs plus untracked file metadata and hashes, so already-dirty files are still protected from accidental review edits.
 
 This repository intentionally keeps the skill small. The supervisor script uses only Node.js built-ins and delegates code understanding and code edits to Codex itself. It does not invent product policy: findings that require business confirmation are reported as questions instead of being automatically fixed.

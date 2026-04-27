@@ -17,7 +17,7 @@ node "<skill-dir>/scripts/review_loop.mjs"
 
 Resolve `<skill-dir>` to the installed directory of this skill, then run the bundled script from there. The script uses `codex exec --ephemeral`, so each review run starts with a fresh Codex context instead of reusing the current thread.
 
-On Windows, the supervisor also disables PowerShell profile loading for child `codex exec` runs so local `profile.ps1` customizations do not break the loop.
+On Windows, the supervisor disables PowerShell profile loading for child `codex exec` runs so local `profile.ps1` customizations do not break the loop. Test commands use PowerShell 7 (`pwsh`) when it is available, then fall back to Windows PowerShell.
 
 ## Required Inputs
 
@@ -58,7 +58,7 @@ If the first review round times out or stalls before producing structured output
 
 ## External Verification
 
-Live web search is mandatory for child review runs. The supervisor enables `--search` by default for `codex exec`; if the local CLI does not support that flag, the run fails instead of silently continuing without external verification.
+Live web search should be used for child review runs when the local Codex CLI supports it. The supervisor requests `--search` by default, detects whether the installed CLI exposes it as a global flag or an `exec` flag, and uses the supported position. If the installed CLI does not expose that flag, the loop continues without passing it and logs that limitation instead of failing before review starts.
 
 ## Severity and Business Rubric
 
@@ -92,6 +92,8 @@ If a finding depends on unclear product policy or business semantics, do not inv
    - where the run artifacts live
 
 ## Command Templates
+
+The examples below use PowerShell line continuation. On macOS or Linux, replace the trailing backticks with `\`.
 
 In-place review for uncommitted work:
 
@@ -134,6 +136,8 @@ node "<skill-dir>/scripts/review_loop.mjs" `
 The script writes per-round debug artifacts under `~/.codex/tmp/self-iterating-review/...` and never writes reports into the repository. The final result is printed to stdout as JSON and includes the run configuration, per-round review and fix summaries, test results, remaining findings, business questions, worktree handoff details, and the artifact paths.
 
 The supervisor forces child `codex exec` runs to use a moderate reasoning effort so the loop does not inherit an overly slow global CLI default such as `model_reasoning_effort = "xhigh"`.
+
+Review rounds run with a read-only sandbox by default. If a Windows Codex CLI rejects that sandbox mode, the supervisor retries with `workspace-write` but fails the run if the review round changes the Git working tree.
 
 When post-fix tests fail, the loop carries those failures into the next review and fix prompts as high-priority evidence. The next round should fix the underlying cause when it is inside scope.
 
