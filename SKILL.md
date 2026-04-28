@@ -1,13 +1,13 @@
 ---
 name: self-iterating-review
-description: Run a multi-round fresh-context code review loop for a Git repository. Use when the user asks to start self-iterating review, loop review, fresh-context review, multi-round self-review, or auto-fix and re-review a scoped change set until there are no current fixable findings, business clarification is needed, or a round limit is reached.
+description: Run a multi-round fresh-context code review loop for a Git repository. Use when the user asks to start self-iterating review, loop review, fresh-context review, multi-round self-review, resume an interrupted review loop, or auto-fix and re-review a scoped change set until there are no current fixable findings, business clarification is needed, or a round limit is reached.
 ---
 
 # Self Iterating Review
 
 ## Overview
 
-Use this skill when the user wants Codex to keep reviewing the same scoped change set in fresh non-interactive runs, fix current defects, run explicit or auto-discovered test commands, and stop only when the scoped code is clean, a finding requires business clarification, or the loop hits a configured round limit.
+Use this skill when the user wants Codex to keep reviewing the same scoped change set in fresh non-interactive runs, fix current defects, infer mechanical details such as base refs and test commands, and stop only when the scoped code is clean, a finding requires business clarification, or the loop hits a configured round limit.
 
 This skill delegates the loop to the bundled supervisor script:
 
@@ -28,10 +28,11 @@ Collect or confirm only these inputs:
 - `max rounds`: optional. Default `6`.
 - `mode`: optional. Default `auto`. In `auto`, use the current checkout when it is already a linked worktree or has uncommitted changes; otherwise create a detached worktree for a clean main checkout. Use explicit `worktree` only when you want another isolated detached worktree.
 - `test timeout`: optional. Default 30 minutes per test command.
+- `resume run`: optional. Use only when continuing from an earlier artifact directory.
 
 If the user does not provide a clear `scope`, ask one short question before running. Do not infer the review boundary from repository state when the human intent is ambiguous.
 
-Do not ask for test commands by default. The supervisor discovers common commands from files such as `package.json`, `pyproject.toml`, `pytest.ini`, `go.mod`, `Cargo.toml`, `.sln`, `Makefile`, and `justfile`. If no command is discovered, the loop continues without test verification and records that limitation in the final JSON.
+Do not ask for test commands by default. The supervisor discovers common commands from files such as `package.json`, `pyproject.toml`, `pytest.ini`, `go.mod`, `Cargo.toml`, `.sln`, `Makefile`, `justfile`, and `.github/workflows/*.yml`. If no command is discovered, the loop continues without test verification and records that limitation in the final JSON.
 
 ## Scope Rules
 
@@ -48,10 +49,14 @@ Bad scope lines are too vague:
 
 Pass hard path boundaries with repeated `--path` flags when they matter.
 
-When the review target is "the current branch against main", prefer the remote-tracking base if the local branch is stale. In practice:
+When the review target is a current branch diff, let the supervisor infer the effective base. It prefers, in order:
 
-- use `origin/main` when `main...origin/main` shows local `main` is behind
-- only use local `main` when you have verified it reflects the intended base
+- an explicit `--base` if you pass one
+- the current GitHub PR base when `gh pr view` is available
+- the upstream merge-base
+- `origin/main`, `main`, `origin/master`, `master`, then `origin/HEAD`
+
+The final JSON records the candidate list, chosen base, confidence, and reason. Do not ask the user to pick these mechanical refs unless the scope itself is unclear.
 
 If the first review round times out or stalls before producing structured output, do not simply keep raising the timeout. Narrow the scope first:
 
@@ -91,16 +96,18 @@ If a finding depends on unclear product policy or business semantics, do not inv
 2. Build one concrete `--scope` string.
 3. Choose `--mode auto`, `--mode in-place`, or `--mode worktree`; omit it only when the default `auto` behavior is intended.
 4. Pass explicit test commands with `--test` only when the user supplied them or when you have a strong reason to override auto-discovery.
-5. Optional: use `--plan-only` first when you want to inspect the resolved base and auto-slice plan without launching child Codex runs.
-6. Run the script.
-7. Read the final JSON printed to stdout and summarize:
+5. Pass `--allow-support-path` only when a fix may need to edit a small known support area outside the scoped paths.
+6. Optional: use `--plan-only` first when you want to inspect the resolved base and auto-slice plan without launching child Codex runs.
+7. Optional: use `--resume <run-dir>` to continue from a previous `final-report.json` or `failure-report.json`.
+8. Run the script.
+9. Read the final JSON printed to stdout and summarize:
    - why the loop stopped
    - how many rounds ran
    - which findings were fixed
    - which findings remain, if any
-   - which business questions need human confirmation, if any
+   - which business questions need human confirmation, if any, including their `question_id`
    - whether tests stayed green
-   - the worktree handoff commit and `git cherry-pick <commit>` command when `worktree` mode created fixes
+   - the worktree handoff commit, auto-apply result, and `git cherry-pick <commit>` command when `worktree` mode created fixes
    - where the run artifacts live
 
 ## Command Templates
@@ -139,6 +146,14 @@ node "<skill-dir>/scripts/review_loop.mjs" `
 
 If the user explicitly wants no test discovery, add `--allow-no-tests`.
 
+If the previous run stopped on a business question and the user answers it, resume with the question id:
+
+```powershell
+node "<skill-dir>/scripts/review_loop.mjs" `
+  --resume "C:\Users\Nanzhi\.codex\tmp\self-iterating-review\<run-id>" `
+  --business-answer "bq_abc123=Archived items must remain read-only."
+```
+
 Plan-only dry run:
 
 ```powershell
@@ -150,7 +165,7 @@ node "<skill-dir>/scripts/review_loop.mjs" `
 
 ## Output Expectations
 
-The script writes per-round debug artifacts under `~/.codex/tmp/self-iterating-review/...` and never writes reports into the repository. The final result is printed to stdout as JSON and includes the run configuration, test discovery plan, per-round review and fix summaries, test results, remaining findings, business questions, worktree handoff details, and the artifact paths.
+The script writes per-round debug artifacts under `~/.codex/tmp/self-iterating-review/...` and never writes reports into the repository. The final result is printed to stdout and saved as JSON. It includes the run configuration, base-ref resolution, test discovery plan, per-round review and fix summaries, test results, remaining findings, business questions, worktree handoff details, and the artifact paths.
 
 The supervisor forces child `codex exec` runs to use a moderate reasoning effort so the loop does not inherit an overly slow global CLI default such as `model_reasoning_effort = "xhigh"`.
 
@@ -158,12 +173,14 @@ Review rounds run with a read-only sandbox by default. If a Windows Codex CLI re
 
 When baseline or post-fix tests fail or time out, the loop carries those failures and full log paths into the next review and fix prompts as high-priority evidence. The next round should fix the underlying cause when it is inside scope.
 
-When `worktree` mode finishes with code changes, the supervisor stages those changes in the detached worktree and creates a handoff commit. The final JSON includes the commit hash and the `git cherry-pick <commit>` command to apply the fix on the original branch.
+Fix rounds are guarded by path boundaries. If a fix modifies a file outside the current slice or the explicit `--path` boundaries, the loop fails unless the file is under an explicit `--allow-support-path`.
+
+When `worktree` mode finishes with code changes, the supervisor stages those changes in the detached worktree and creates a handoff commit. If the source checkout is still clean and HEAD is unchanged, it automatically cherry-picks the handoff commit back to the source branch. If that is not safe, the final JSON includes the commit hash and the `git cherry-pick <commit>` command.
 
 When the scope is a clean branch diff against `main` or `origin/main`, the supervisor now:
 
 - resolves the effective base ref before review starts
-- prefers `origin/main` when local `main` is behind
+- records base-ref candidates and the chosen reason
 - computes a diff-based slice plan before the first child review run
 - auto-splits oversized diffs into smaller file batches, grouped by top-level area when possible
 - embeds a bounded diff summary and patch excerpt into each child review prompt

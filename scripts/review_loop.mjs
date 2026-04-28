@@ -17,6 +17,7 @@ const DEFAULT_TEST_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_CHILD_REASONING_EFFORT = "medium";
 const DEFAULT_SEARCH = true;
 const DISCOVERED_TEST_COMMAND_LIMIT = 4;
+const AUTO_BASE_CANDIDATE_LIMIT = 8;
 const AUTO_SLICE_MAX_FILES = 18;
 const AUTO_SLICE_MAX_CHANGED_LINES = 900;
 const DIFF_CONTEXT_CHAR_LIMIT = 60_000;
@@ -49,6 +50,9 @@ async function main() {
     process.stdout.write(`${JSON.stringify(finalReport, null, 2)}\n`);
   } catch (error) {
     const failureReport = buildFailureReport(error, context.runState);
+    if (context.runState?.artifactPaths?.failureReport) {
+      writeJson(context.runState.artifactPaths.failureReport, failureReport);
+    }
     process.stdout.write(`${JSON.stringify(failureReport, null, 2)}\n`);
     process.exitCode = 1;
   }
@@ -61,9 +65,11 @@ async function runLoop(context) {
 
   const repoRoot = getGitRepoRoot(config.repoPath);
   config.paths = normalizeScopePaths(config.paths, repoRoot);
+  config.allowSupportPaths = normalizeScopePaths(config.allowSupportPaths, repoRoot);
   const repoName = path.basename(repoRoot);
   const initialStatus = getGitStatus(repoRoot);
-  const resolvedBase = resolveScopeBaseRef(repoRoot, config.scope);
+  const initialHead = getGitHead(repoRoot);
+  const resolvedBase = resolveScopeBaseRef(repoRoot, config.scope, config);
   config.requestedMode = config.mode;
   config.mode = resolveExecutionMode(config.mode, {
     repoRoot,
@@ -119,6 +125,8 @@ async function runLoop(context) {
     worktreeCommit: null,
     finalStatus: "unknown",
     stopReason: "unknown",
+    initialHead,
+    baseResolution: resolvedBase,
     resolvedBaseRef: resolvedBase?.resolvedRef ?? null,
     slicePlan: reviewSlices.map(serializeSlicePlan),
     globalRoundCounter: 0,
@@ -127,6 +135,8 @@ async function runLoop(context) {
       reviewSchema: REVIEW_SCHEMA_PATH,
       fixSchema: FIX_SCHEMA_PATH,
       testPlan: testPlanPath,
+      finalReport: path.join(runDir, "final-report.json"),
+      failureReport: path.join(runDir, "failure-report.json"),
     },
   };
 
@@ -160,7 +170,15 @@ async function runLoop(context) {
     );
   }
 
+  const resumableSlices = buildResumableSliceMap(config.resumeReport);
   for (const slice of reviewSlices) {
+    const resumedSlice = resumableSlices.get(slice.id);
+    if (resumedSlice) {
+      log(`Slice ${slice.label}: reusing clean result from resumed run.`);
+      runState.slices.push(resumedSlice);
+      continue;
+    }
+
     const sliceResult = await runSliceLoop({
       config,
       runState,
@@ -186,7 +204,9 @@ async function runLoop(context) {
   runState.worktreeCommit = createWorktreeCommitIfNeeded(runState);
 
   log(`Finished with status '${runState.finalStatus}'.`);
-  return buildFinalReport(runState);
+  const finalReport = buildFinalReport(runState);
+  writeJson(runState.artifactPaths.finalReport, finalReport);
+  return finalReport;
 }
 
 function parseArgs(argv) {
@@ -196,13 +216,19 @@ function parseArgs(argv) {
     mode: DEFAULT_MODE,
     maxRounds: DEFAULT_MAX_ROUNDS,
     stopCondition: DEFAULT_STOP_CONDITION,
+    baseRef: "",
     tests: [],
     paths: [],
+    allowSupportPaths: [],
     focus: [...DEFAULT_FOCUS],
     extraInstructions: [],
     model: "",
     allowNoTests: false,
+    autoApplyWorktree: true,
     planOnly: false,
+    resumeDir: "",
+    resumeReport: null,
+    businessAnswers: {},
     search: DEFAULT_SEARCH,
     codexTimeoutMs: DEFAULT_CODEX_TIMEOUT_MS,
     testTimeoutMs: DEFAULT_TEST_TIMEOUT_MS,
@@ -228,11 +254,17 @@ function parseArgs(argv) {
       case "--stop-condition":
         config.stopCondition = readRequiredValue(argv, ++index, "--stop-condition");
         break;
+      case "--base":
+        config.baseRef = readRequiredValue(argv, ++index, "--base");
+        break;
       case "--test":
         config.tests.push(readRequiredValue(argv, ++index, "--test"));
         break;
       case "--path":
         config.paths.push(readRequiredValue(argv, ++index, "--path"));
+        break;
+      case "--allow-support-path":
+        config.allowSupportPaths.push(readRequiredValue(argv, ++index, "--allow-support-path"));
         break;
       case "--focus":
         config.focus.push(readRequiredValue(argv, ++index, "--focus"));
@@ -252,9 +284,20 @@ function parseArgs(argv) {
       case "--allow-no-tests":
         config.allowNoTests = true;
         break;
+      case "--no-auto-apply-worktree":
+        config.autoApplyWorktree = false;
+        break;
       case "--plan-only":
         config.planOnly = true;
         break;
+      case "--resume":
+        config.resumeDir = path.resolve(readRequiredValue(argv, ++index, "--resume"));
+        break;
+      case "--business-answer": {
+        const { questionId, answer } = parseBusinessAnswer(readRequiredValue(argv, ++index, "--business-answer"));
+        config.businessAnswers[questionId] = answer;
+        break;
+      }
       case "--search":
         config.search = true;
         break;
@@ -268,9 +311,11 @@ function parseArgs(argv) {
     }
   }
 
+  applyResumeDefaults(config);
   validateConfig(config);
   config.focus = normalizeDistinctStrings(config.focus);
   config.paths = normalizeDistinctStrings(config.paths.map((item) => path.normalize(item)));
+  config.allowSupportPaths = normalizeDistinctStrings(config.allowSupportPaths.map((item) => path.normalize(item)));
   config.tests = normalizeDistinctStrings(config.tests);
   config.extraInstructions = normalizeDistinctStrings(config.extraInstructions);
   return config;
@@ -291,6 +336,10 @@ function validateConfig(config) {
 
   if (!["current-clean", "no-new-p1p2"].includes(config.stopCondition)) {
     fail("`--stop-condition` must be either `current-clean` or `no-new-p1p2`.");
+  }
+
+  if (config.baseRef && !config.baseRef.trim()) {
+    fail("`--base` must not be blank.");
   }
 
   if (!Number.isInteger(config.codexTimeoutMs) || config.codexTimeoutMs < 10000) {
@@ -316,7 +365,9 @@ function printHelp() {
     "  --mode <auto|in-place|worktree>  Execution mode (default: auto)",
     "  --max-rounds <n>            Maximum review rounds (default: 6)",
     "  --stop-condition <value>    current-clean or no-new-p1p2",
+    "  --base <ref>                Optional explicit diff base ref",
     "  --path <path>               Hard path boundary, repeatable",
+    "  --allow-support-path <path> Allow fix support edits outside the hard path, repeatable",
     "  --focus <text>              Extra review focus, repeatable",
     "  --extra-instruction <text>  Extra instruction for review and fix prompts",
     "  --model <name>              Optional model override for codex exec",
@@ -324,10 +375,112 @@ function printHelp() {
     `  --test-timeout-ms <ms>      Per-command test timeout (default: ${DEFAULT_TEST_TIMEOUT_MS})`,
     "  --search                    Request live web search in codex exec when supported (default: requested)",
     "  --allow-no-tests            Skip automatic test discovery",
+    "  --no-auto-apply-worktree    Keep worktree fixes as a handoff commit",
+    "  --resume <run-dir>          Resume from a previous run report when possible",
+    "  --business-answer <id=text> Provide a business decision for resume prompts",
     "  --plan-only                 Print the resolved base + auto-slice plan without launching Codex",
   ];
 
   process.stdout.write(`${lines.join("\n")}\n`);
+}
+
+function applyResumeDefaults(config) {
+  if (!config.resumeDir) {
+    return;
+  }
+
+  const resumeReport = loadResumeReport(config.resumeDir);
+  config.resumeReport = resumeReport;
+  const previousConfig = resumeReport.config || {};
+
+  if (!config.scope && previousConfig.scope) {
+    config.scope = previousConfig.scope;
+  }
+
+  if (config.tests.length === 0 && Array.isArray(previousConfig.tests)) {
+    config.tests = previousConfig.tests;
+  }
+
+  if (config.paths.length === 0 && Array.isArray(previousConfig.paths)) {
+    config.paths = previousConfig.paths;
+  }
+
+  if (config.allowSupportPaths.length === 0 && Array.isArray(previousConfig.allow_support_paths)) {
+    config.allowSupportPaths = previousConfig.allow_support_paths;
+  }
+
+  if (!config.baseRef && resumeReport.resolved_base_ref) {
+    config.baseRef = resumeReport.resolved_base_ref;
+  }
+
+  if (Object.keys(config.businessAnswers).length === 0 && previousConfig.business_answers) {
+    config.businessAnswers = previousConfig.business_answers;
+  }
+}
+
+function loadResumeReport(resumeDir) {
+  const reportPathCandidates = [
+    path.join(resumeDir, "failure-report.json"),
+    path.join(resumeDir, "final-report.json"),
+  ];
+  const reportPath = reportPathCandidates.find((candidate) => fs.existsSync(candidate));
+
+  if (!reportPath) {
+    fail(`Cannot resume because no final-report.json or failure-report.json exists in ${resumeDir}.`);
+  }
+
+  const report = readJsonFile(reportPath);
+  if (!report || typeof report !== "object") {
+    fail(`Cannot resume because ${reportPath} is not valid JSON.`);
+  }
+
+  return {
+    ...report,
+    resume_report_path: reportPath,
+  };
+}
+
+function parseBusinessAnswer(value) {
+  const separatorIndex = value.indexOf("=");
+  if (separatorIndex <= 0 || separatorIndex === value.length - 1) {
+    fail("`--business-answer` must use the format `<question_id>=<answer>`.");
+  }
+
+  return {
+    questionId: normalizeWhitespace(value.slice(0, separatorIndex)),
+    answer: normalizeWhitespace(value.slice(separatorIndex + 1)),
+  };
+}
+
+function buildResumableSliceMap(resumeReport) {
+  const result = new Map();
+  if (!resumeReport || !Array.isArray(resumeReport.slices)) {
+    return result;
+  }
+
+  for (const slice of resumeReport.slices) {
+    const finalActiveFindings = Array.isArray(slice.final_active_findings)
+      ? slice.final_active_findings
+      : [];
+    if (slice.stop_reason !== "clean" || finalActiveFindings.length > 0) {
+      continue;
+    }
+
+    result.set(slice.id, {
+      id: slice.id,
+      label: slice.label,
+      scope: slice.scope,
+      paths: slice.paths || [],
+      baseRef: slice.base_ref ?? null,
+      diff: null,
+      stopReason: "clean",
+      finalActiveFindings: [],
+      rounds: [],
+      resumedFrom: resumeReport.run_id ?? null,
+    });
+  }
+
+  return result;
 }
 
 function resolveTestPlan(config, repoRoot) {
@@ -383,6 +536,7 @@ function discoverTestCommands(repoRoot) {
   discoverRustTestCommands(repoRoot, addCandidate, notes);
   discoverDotnetTestCommands(repoRoot, addCandidate, notes);
   discoverMakeTestCommands(repoRoot, addCandidate, notes);
+  discoverGithubActionsTestCommands(repoRoot, addCandidate, notes);
 
   const commands = candidates.map((candidate) => candidate.command);
   const confidence = candidates.some((candidate) => candidate.confidence === "high")
@@ -477,6 +631,93 @@ function discoverMakeTestCommands(repoRoot, addCandidate) {
   }
 }
 
+function discoverGithubActionsTestCommands(repoRoot, addCandidate, notes) {
+  const workflowsDir = path.join(repoRoot, ".github", "workflows");
+  if (!fs.existsSync(workflowsDir)) {
+    return;
+  }
+
+  const workflowFiles = listFilesRecursive(workflowsDir)
+    .filter((filePath) => /\.(ya?ml)$/i.test(filePath))
+    .sort();
+
+  for (const workflowFile of workflowFiles) {
+    const relativeWorkflowPath = toPosixPath(path.relative(repoRoot, workflowFile));
+    const commands = extractGithubActionsRunCommands(readTextFile(workflowFile));
+    for (const command of commands) {
+      if (!isLikelyVerificationCommand(command)) {
+        continue;
+      }
+
+      addCandidate(command, "medium", `GitHub Actions ${relativeWorkflowPath}`);
+    }
+  }
+
+  if (workflowFiles.length > 0) {
+    notes.push(`Scanned ${workflowFiles.length} GitHub Actions workflow file(s) for verification commands.`);
+  }
+}
+
+function extractGithubActionsRunCommands(workflowText) {
+  const lines = String(workflowText || "").split(/\r?\n/);
+  const commands = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const inlineMatch = line.match(/^\s*(?:-\s*)?run:\s*(.+?)\s*$/);
+    if (!inlineMatch) {
+      continue;
+    }
+
+    const inlineCommand = inlineMatch[1].trim();
+    if (inlineCommand === "|" || inlineCommand === ">") {
+      const baseIndent = countLeadingSpaces(line);
+      const blockLines = [];
+      for (let blockIndex = index + 1; blockIndex < lines.length; blockIndex += 1) {
+        const blockLine = lines[blockIndex];
+        if (!blockLine.trim()) {
+          continue;
+        }
+        if (countLeadingSpaces(blockLine) <= baseIndent) {
+          break;
+        }
+        blockLines.push(blockLine.trim());
+        index = blockIndex;
+      }
+      commands.push(...splitShellCommandLines(blockLines.join("\n")));
+      continue;
+    }
+
+    commands.push(...splitShellCommandLines(inlineCommand));
+  }
+
+  return commands;
+}
+
+function splitShellCommandLines(commandText) {
+  return String(commandText || "")
+    .split(/\r?\n|&&|;/)
+    .map((line) => normalizeWhitespace(line.replace(/^-\s+/, "")))
+    .filter(Boolean);
+}
+
+function isLikelyVerificationCommand(command) {
+  const normalized = command.toLowerCase();
+  if (/\b(install|publish|deploy|release|upload|docker|checkout)\b/.test(normalized)) {
+    return false;
+  }
+
+  return (
+    /\b(test|pytest|vitest|jest|mocha|ava|tap)\b/.test(normalized) ||
+    /\b(lint|eslint|ruff|flake8|mypy|typecheck|tsc)\b/.test(normalized) ||
+    /\bgo test\b/.test(normalized) ||
+    /\bcargo test\b/.test(normalized) ||
+    /\bdotnet test\b/.test(normalized) ||
+    /\bmake test\b/.test(normalized) ||
+    /\bjust test\b/.test(normalized)
+  );
+}
+
 function detectPackageManager(repoRoot) {
   if (fs.existsSync(path.join(repoRoot, "pnpm-lock.yaml")) || fs.existsSync(path.join(repoRoot, "pnpm-workspace.yaml"))) {
     return "pnpm";
@@ -541,6 +782,28 @@ function listRootFiles(repoRoot) {
   } catch {
     return [];
   }
+}
+
+function listFilesRecursive(rootDir) {
+  const results = [];
+  const entries = fs.readdirSync(rootDir, { withFileTypes: true });
+
+  for (const entry of entries) {
+    const entryPath = path.join(rootDir, entry.name);
+    if (entry.isDirectory()) {
+      results.push(...listFilesRecursive(entryPath));
+      continue;
+    }
+    if (entry.isFile()) {
+      results.push(entryPath);
+    }
+  }
+
+  return results;
+}
+
+function countLeadingSpaces(value) {
+  return String(value).match(/^\s*/)[0].length;
 }
 
 function prepareTargetWorkspace({ config, repoRoot, runDir }) {
@@ -799,6 +1062,7 @@ async function runFixRound({
   previousFailedTests,
 }) {
   const outputPath = path.join(roundDir, "fix-output.json");
+  const initialFileStates = getWorkspaceFileStateMap(targetCwd);
   const prompt = buildFixPrompt({
     config,
     slice,
@@ -809,7 +1073,7 @@ async function runFixRound({
     previousFailedTests,
   });
 
-  return runCodexStructured({
+  const parsed = await runCodexStructured({
     cwd: targetCwd,
     sandbox: "workspace-write",
     schemaPath: FIX_SCHEMA_PATH,
@@ -821,6 +1085,25 @@ async function runFixRound({
     phase: "fix",
     roundNumber,
   });
+
+  const changedOutsideScope = findOutOfScopeFixChanges({
+    cwd: targetCwd,
+    beforeStates: initialFileStates,
+    slice,
+    allowedSupportPaths: config.allowSupportPaths,
+  });
+  if (changedOutsideScope.length > 0) {
+    fail("Fix round changed files outside the scoped boundaries.", {
+      errorType: "out_of_scope_fix_change",
+      phase: "fix",
+      round: roundNumber,
+      outputPath,
+      cwd: targetCwd,
+      changedOutsideScope,
+    });
+  }
+
+  return parsed;
 }
 
 async function runCodexStructured({
@@ -982,6 +1265,7 @@ function buildReviewPrompt({
 
   const focusLines = config.focus.map((item) => `- ${item}`);
   const extraInstructionLines = config.extraInstructions.map((item) => `- ${item}`);
+  const businessAnswerLines = buildBusinessAnswerPromptLines(config.businessAnswers);
   const diffContextLines = buildSliceDiffPromptLines(slice);
   const failedTestLines = buildFailedTestPromptLines(previousFailedTests);
 
@@ -1013,6 +1297,9 @@ function buildReviewPrompt({
     "Previously failed tests:",
     ...failedTestLines,
     "",
+    "Confirmed business answers:",
+    ...businessAnswerLines,
+    "",
     "Rules:",
     "- You may inspect repository context outside the scope, but only report findings whose root cause is inside the scope.",
     "- Report only current issues that are still present in this checkout.",
@@ -1024,6 +1311,7 @@ function buildReviewPrompt({
     "- Add every business-semantics question to `business_questions` with the related finding title in `blocked_findings`.",
     "- Deduplicate findings within this run.",
     "- Keep titles short and stable.",
+    "- `dedupe_key` must be a stable mechanism key independent of severity and title.",
     "- `fingerprint_basis` must be a terse and stable phrase describing the bug mechanism.",
     "- Return JSON that matches the provided schema exactly.",
     ...(buildWindowsShellRuleLines()),
@@ -1051,6 +1339,7 @@ function buildFixPrompt({
     why: finding.why,
     repro_or_evidence: finding.reproOrEvidence,
     fix_strategy: finding.fixStrategy,
+    dedupe_key: finding.dedupeKey,
     fingerprint_basis: finding.fingerprintBasis,
   }));
 
@@ -1061,8 +1350,12 @@ function buildFixPrompt({
   const pathLines = slice.paths.length === 0
     ? ["- No hard path filter. Respect the scope sentence."]
     : slice.paths.map((item) => `- ${item}`);
+  const supportPathLines = config.allowSupportPaths.length === 0
+    ? ["- None."]
+    : config.allowSupportPaths.map((item) => `- ${item}`);
 
   const extraInstructionLines = config.extraInstructions.map((item) => `- ${item}`);
+  const businessAnswerLines = buildBusinessAnswerPromptLines(config.businessAnswers);
   const diffContextLines = buildSliceDiffPromptLines(slice);
   const failedTestLines = buildFailedTestPromptLines(previousFailedTests);
 
@@ -1078,6 +1371,9 @@ function buildFixPrompt({
     "",
     "Hard path boundaries:",
     ...pathLines,
+    "",
+    "Allowed support edit paths:",
+    ...supportPathLines,
     ...(diffContextLines.length > 0
       ? ["", "Scoped branch diff context:", ...diffContextLines]
       : []),
@@ -1087,6 +1383,9 @@ function buildFixPrompt({
     "",
     "Previously failed tests to prioritize:",
     ...failedTestLines,
+    "",
+    "Confirmed business answers:",
+    ...businessAnswerLines,
     "",
     "Active findings:",
     JSON.stringify(findingsPayload, null, 2),
@@ -1115,6 +1414,15 @@ function buildFailedTestPromptLines(failedTests) {
   return failedTests.map((test) => (
     `- ${test.command}: ${test.status}; stdout log: ${test.stdoutPath || "n/a"}; stderr log: ${test.stderrPath || "n/a"}; stdout tail: ${truncate(test.stdoutTail || "")}; stderr tail: ${truncate(test.stderrTail || "")}`
   ));
+}
+
+function buildBusinessAnswerPromptLines(businessAnswers) {
+  const entries = Object.entries(businessAnswers || {});
+  if (entries.length === 0) {
+    return ["- None."];
+  }
+
+  return entries.map(([questionId, answer]) => `- ${questionId}: ${answer}`);
 }
 
 function runTests(commands, cwd, outputDir, timeoutMs) {
@@ -1166,6 +1474,7 @@ function updateFindingLedger(ledger, activeFindings, roundNumber) {
         why: finding.why,
         reproOrEvidence: finding.reproOrEvidence,
         fixStrategy: finding.fixStrategy,
+        dedupeKey: finding.dedupeKey,
         fingerprintBasis: finding.fingerprintBasis,
         requiresBusinessConfirmation: finding.requiresBusinessConfirmation,
         businessQuestion: finding.businessQuestion,
@@ -1209,21 +1518,32 @@ function buildFinalReport(runState) {
     worktree_path: runState.worktreePath,
     skill_dir: SKILL_DIR,
     resolved_base_ref: runState.resolvedBaseRef,
+    base_resolution: runState.baseResolution,
+    resumed_from: runState.config.resumeReport
+      ? {
+          run_id: runState.config.resumeReport.run_id ?? null,
+          report_path: runState.config.resumeReport.resume_report_path,
+        }
+      : null,
     config: {
       scope: runState.config.scope,
       requested_mode: runState.config.requestedMode,
       mode: runState.config.mode,
+      base_ref: runState.config.baseRef || null,
       max_rounds: runState.config.maxRounds,
       stop_condition: runState.config.stopCondition,
       tests: runState.config.tests,
       test_plan: runState.config.testPlan,
       test_timeout_ms: runState.config.testTimeoutMs,
       paths: runState.config.paths,
+      allow_support_paths: runState.config.allowSupportPaths,
       focus: runState.config.focus,
       extra_instructions: runState.config.extraInstructions,
       model: runState.config.model || null,
       search: runState.config.search,
       allow_no_tests: runState.config.allowNoTests,
+      auto_apply_worktree: runState.config.autoApplyWorktree,
+      business_answers: runState.config.businessAnswers,
       plan_only: runState.config.planOnly,
     },
     stop_reason: runState.stopReason,
@@ -1237,6 +1557,7 @@ function buildFinalReport(runState) {
       scope: slice.scope,
       base_ref: slice.baseRef,
       paths: slice.paths,
+      resumed_from: slice.resumedFrom ?? null,
       stop_reason: slice.stopReason,
       final_active_findings: slice.finalActiveFindings.map(serializeFindingForReport),
       rounds: slice.rounds.map((round) => ({
@@ -1313,6 +1634,7 @@ function normalizeFinding(finding, repoRoot) {
     why: normalizeWhitespace(finding.why || ""),
     reproOrEvidence: normalizeWhitespace(finding.repro_or_evidence || ""),
     fixStrategy: normalizeWhitespace(finding.fix_strategy || ""),
+    dedupeKey: normalizeWhitespace(finding.dedupe_key || finding.fingerprint_basis || ""),
     fingerprintBasis: normalizeWhitespace(finding.fingerprint_basis || ""),
     requiresBusinessConfirmation: Boolean(finding.requires_business_confirmation),
     businessQuestion: finding.business_question
@@ -1326,25 +1648,33 @@ function normalizeFinding(finding, repoRoot) {
 }
 
 function normalizeBusinessQuestions(questions, repoRoot) {
-  return questions.map((question) => ({
-    title: normalizeWhitespace(question.title || ""),
-    file: normalizeFilePath(question.file, repoRoot),
-    question: normalizeWhitespace(question.question || ""),
-    blockedFindings: Array.isArray(question.blocked_findings)
-      ? question.blocked_findings.map((item) => normalizeWhitespace(item)).filter(Boolean)
-      : [],
-  })).filter((question) => question.title && question.question);
+  return questions.map((question) => {
+    const normalizedQuestion = {
+      title: normalizeWhitespace(question.title || ""),
+      file: normalizeFilePath(question.file, repoRoot),
+      question: normalizeWhitespace(question.question || ""),
+      blockedFindings: Array.isArray(question.blocked_findings)
+        ? question.blocked_findings.map((item) => normalizeWhitespace(item)).filter(Boolean)
+        : [],
+    };
+    normalizedQuestion.questionId = buildBusinessQuestionId(normalizedQuestion);
+    return normalizedQuestion;
+  }).filter((question) => question.title && question.question);
 }
 
 function buildFindingBusinessQuestions(findings) {
   return findings
     .filter((finding) => finding.requiresBusinessConfirmation && finding.businessQuestion)
-    .map((finding) => ({
-      title: finding.title,
-      file: finding.file,
-      question: finding.businessQuestion,
-      blockedFindings: [finding.title],
-    }));
+    .map((finding) => {
+      const question = {
+        title: finding.title,
+        file: finding.file,
+        question: finding.businessQuestion,
+        blockedFindings: [finding.title],
+      };
+      question.questionId = buildBusinessQuestionId(question);
+      return question;
+    });
 }
 
 function deduplicateBusinessQuestions(questions) {
@@ -1369,12 +1699,22 @@ function deduplicateBusinessQuestions(questions) {
   return result;
 }
 
+function buildBusinessQuestionId(question) {
+  const raw = [
+    question.file || "",
+    question.title || "",
+    question.question || "",
+  ].map((item) => normalizeWhitespace(String(item)).toLowerCase()).join("|");
+
+  return `bq_${crypto.createHash("sha256").update(raw).digest("hex").slice(0, 12)}`;
+}
+
 function deduplicateFindings(findings) {
   const seen = new Set();
   const result = [];
 
   for (const finding of findings) {
-    if (!finding.title || !finding.why || !finding.fingerprintBasis) {
+    if (!finding.title || !finding.why || !finding.fingerprintBasis || !finding.dedupeKey) {
       continue;
     }
 
@@ -1391,10 +1731,9 @@ function deduplicateFindings(findings) {
 
 function buildFindingFingerprint(finding) {
   const raw = [
-    finding.severity,
     finding.file || "",
-    finding.title,
-    finding.fingerprintBasis,
+    finding.lineStart ? String(Math.floor((finding.lineStart - 1) / 20)) : "",
+    finding.dedupeKey || finding.fingerprintBasis,
   ]
     .map((item) => normalizeWhitespace(String(item)).toLowerCase())
     .join("|");
@@ -1421,6 +1760,7 @@ function serializeFindingForReport(finding) {
     why: finding.why,
     repro_or_evidence: finding.reproOrEvidence,
     fix_strategy: finding.fixStrategy,
+    dedupe_key: finding.dedupeKey,
     fingerprint_basis: finding.fingerprintBasis,
     requires_business_confirmation: finding.requiresBusinessConfirmation,
     business_question: finding.businessQuestion,
@@ -1430,6 +1770,7 @@ function serializeFindingForReport(finding) {
 
 function serializeBusinessQuestionForReport(question) {
   return {
+    question_id: question.questionId,
     title: question.title,
     file: question.file,
     question: question.question,
@@ -1456,6 +1797,7 @@ function buildFailureReport(error, runState) {
     target_cwd: runState?.targetCwd ?? null,
     worktree_path: runState?.worktreePath ?? null,
     resolved_base_ref: runState?.resolvedBaseRef ?? null,
+    base_resolution: runState?.baseResolution ?? null,
     final_status: "failed",
     stop_reason: "failed",
     rounds_executed: runState?.rounds.length ?? 0,
@@ -1467,6 +1809,7 @@ function buildFailureReport(error, runState) {
     signal: details.signal ?? null,
     cwd: details.cwd ?? null,
     sandbox: details.sandbox ?? null,
+    config: runState ? serializeRunConfig(runState.config) : null,
     artifact_paths: {
       ...(runState?.artifactPaths ?? {}),
       stdout_log: details.stdoutPath ?? null,
@@ -1490,6 +1833,30 @@ function buildFailureReport(error, runState) {
     })) ?? [],
     command_failure: details.commandFailure ?? null,
     raw_output: details.rawOutput ?? null,
+  };
+}
+
+function serializeRunConfig(config) {
+  return {
+    scope: config.scope,
+    requested_mode: config.requestedMode,
+    mode: config.mode,
+    base_ref: config.baseRef || null,
+    max_rounds: config.maxRounds,
+    stop_condition: config.stopCondition,
+    tests: config.tests,
+    test_plan: config.testPlan,
+    test_timeout_ms: config.testTimeoutMs,
+    paths: config.paths,
+    allow_support_paths: config.allowSupportPaths,
+    focus: config.focus,
+    extra_instructions: config.extraInstructions,
+    model: config.model || null,
+    search: config.search,
+    allow_no_tests: config.allowNoTests,
+    auto_apply_worktree: config.autoApplyWorktree,
+    business_answers: config.businessAnswers,
+    plan_only: config.planOnly,
   };
 }
 
@@ -1536,8 +1903,46 @@ function normalizeScopePaths(paths, repoRoot) {
   }));
 }
 
-function resolveScopeBaseRef(repoRoot, scope) {
+function resolveScopeBaseRef(repoRoot, scope, config = {}) {
   const normalizedScope = String(scope).toLowerCase();
+  const candidates = [];
+
+  function chooseCandidate(candidate) {
+    return {
+      requestedRef: candidate.requestedRef,
+      resolvedRef: candidate.resolvedRef,
+      reason: candidate.reason,
+      confidence: candidate.confidence,
+      candidates,
+    };
+  }
+
+  function addCandidate(requestedRef, reason, confidence = "medium") {
+    if (!requestedRef || candidates.some((candidate) => candidate.requestedRef === requestedRef)) {
+      return null;
+    }
+
+    const exists = gitRefExists(repoRoot, requestedRef);
+    const candidate = {
+      requestedRef,
+      resolvedRef: exists ? requestedRef : null,
+      reason,
+      confidence,
+      exists,
+    };
+    candidates.push(candidate);
+    return candidate;
+  }
+
+  if (config.baseRef) {
+    const explicitCandidate = addCandidate(config.baseRef, "explicit-base-flag", "high");
+    if (!explicitCandidate?.exists) {
+      fail(`The explicit base ref does not exist locally: ${config.baseRef}`);
+    }
+
+    return chooseCandidate(explicitCandidate);
+  }
+
   const mentionsOriginMain =
     normalizedScope.includes("against origin/main") ||
     normalizedScope.includes("diff against origin/main");
@@ -1546,19 +1951,22 @@ function resolveScopeBaseRef(repoRoot, scope) {
     normalizedScope.includes("diff against main");
 
   if (!mentionsOriginMain && !mentionsLocalMain) {
-    return null;
+    if (!scopeLooksLikeBranchDiff(normalizedScope)) {
+      return null;
+    }
+
+    collectAutoBaseCandidates(repoRoot, candidates, addCandidate);
+    const selected = candidates.find((candidate) => candidate.exists);
+    return selected ? chooseCandidate(selected) : null;
   }
 
   if (mentionsOriginMain) {
-    if (!gitRefExists(repoRoot, "origin/main")) {
+    const explicitOriginMain = addCandidate("origin/main", "explicit-origin-main", "high");
+    if (!explicitOriginMain?.exists) {
       fail("The scope explicitly references `origin/main`, but that ref does not exist locally.");
     }
 
-    return {
-      requestedRef: "origin/main",
-      resolvedRef: "origin/main",
-      reason: "explicit-origin-main",
-    };
+    return chooseCandidate(explicitOriginMain);
   }
 
   const localMainExists = gitRefExists(repoRoot, "main");
@@ -1569,35 +1977,105 @@ function resolveScopeBaseRef(repoRoot, scope) {
   }
 
   if (!localMainExists && remoteMainExists) {
-    return {
-      requestedRef: "main",
-      resolvedRef: "origin/main",
-      reason: "local-main-missing",
-    };
+    const candidate = addCandidate("origin/main", "local-main-missing", "high");
+    candidate.requestedRef = "main";
+    return chooseCandidate(candidate);
   }
 
   if (localMainExists && !remoteMainExists) {
-    return {
-      requestedRef: "main",
-      resolvedRef: "main",
-      reason: "origin-main-missing",
-    };
+    return chooseCandidate(addCandidate("main", "origin-main-missing", "high"));
   }
 
   const divergence = getRefDivergence(repoRoot, "main", "origin/main");
   if (divergence.right > 0 && divergence.left === 0) {
-    return {
-      requestedRef: "main",
-      resolvedRef: "origin/main",
-      reason: "local-main-behind-origin",
-    };
+    const candidate = addCandidate("origin/main", "local-main-behind-origin", "high");
+    candidate.requestedRef = "main";
+    return chooseCandidate(candidate);
   }
 
-  return {
-    requestedRef: "main",
-    resolvedRef: "main",
-    reason: "local-main-current",
-  };
+  return chooseCandidate(addCandidate("main", "local-main-current", "high"));
+}
+
+function scopeLooksLikeBranchDiff(normalizedScope) {
+  if (
+    normalizedScope.includes("uncommitted") ||
+    normalizedScope.includes("working tree") ||
+    normalizedScope.includes("working-tree") ||
+    normalizedScope.includes("unstaged") ||
+    normalizedScope.includes("staged")
+  ) {
+    return false;
+  }
+
+  return (
+    normalizedScope.includes("current branch") ||
+    normalizedScope.includes("branch diff") ||
+    normalizedScope.includes("branch against") ||
+    normalizedScope.includes("against upstream") ||
+    normalizedScope.includes("against default")
+  );
+}
+
+function collectAutoBaseCandidates(repoRoot, candidates, addCandidate) {
+  const prBase = getCurrentPullRequestBaseRef(repoRoot);
+  if (prBase) {
+    const remoteBase = `origin/${prBase}`;
+    const candidate = gitRefExists(repoRoot, remoteBase)
+      ? addCandidate(remoteBase, "current-pr-base", "high")
+      : addCandidate(prBase, "current-pr-base", "high");
+    if (candidate?.exists) {
+      return;
+    }
+  }
+
+  const upstreamMergeBase = getUpstreamMergeBase(repoRoot);
+  if (upstreamMergeBase) {
+    addCandidate(upstreamMergeBase, "upstream-merge-base", "medium");
+  }
+
+  for (const refName of ["origin/main", "main", "origin/master", "master", "origin/HEAD"].slice(0, AUTO_BASE_CANDIDATE_LIMIT)) {
+    addCandidate(refName, "default-branch-candidate", "medium");
+  }
+}
+
+function getCurrentPullRequestBaseRef(repoRoot) {
+  if (!commandExists("gh")) {
+    return null;
+  }
+
+  const result = runProcess("gh", ["pr", "view", "--json", "baseRefName", "--jq", ".baseRefName"], {
+    cwd: repoRoot,
+    timeout: 15000,
+  });
+
+  if (result.status !== 0) {
+    return null;
+  }
+
+  return normalizeWhitespace(result.stdout || "");
+}
+
+function getUpstreamMergeBase(repoRoot) {
+  const upstreamResult = runProcess("git", ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], {
+    cwd: repoRoot,
+  });
+  if (upstreamResult.status !== 0) {
+    return null;
+  }
+
+  const upstreamRef = normalizeWhitespace(upstreamResult.stdout || "");
+  if (!upstreamRef) {
+    return null;
+  }
+
+  const mergeBaseResult = runProcess("git", ["merge-base", "HEAD", upstreamRef], {
+    cwd: repoRoot,
+  });
+  if (mergeBaseResult.status !== 0) {
+    return null;
+  }
+
+  return normalizeWhitespace(mergeBaseResult.stdout || "");
 }
 
 function buildReviewSlices({ config, repoRoot, resolvedBase, allowAutoSlicing }) {
@@ -1919,21 +2397,32 @@ function buildPlanOnlyReport(runState) {
     target_cwd: runState.targetCwd,
     worktree_path: runState.worktreePath,
     resolved_base_ref: runState.resolvedBaseRef,
+    base_resolution: runState.baseResolution,
+    resumed_from: runState.config.resumeReport
+      ? {
+          run_id: runState.config.resumeReport.run_id ?? null,
+          report_path: runState.config.resumeReport.resume_report_path,
+        }
+      : null,
     config: {
       scope: runState.config.scope,
       requested_mode: runState.config.requestedMode,
       mode: runState.config.mode,
+      base_ref: runState.config.baseRef || null,
       max_rounds: runState.config.maxRounds,
       stop_condition: runState.config.stopCondition,
       tests: runState.config.tests,
       test_plan: runState.config.testPlan,
       test_timeout_ms: runState.config.testTimeoutMs,
       paths: runState.config.paths,
+      allow_support_paths: runState.config.allowSupportPaths,
       focus: runState.config.focus,
       extra_instructions: runState.config.extraInstructions,
       model: runState.config.model || null,
       search: runState.config.search,
       allow_no_tests: runState.config.allowNoTests,
+      auto_apply_worktree: runState.config.autoApplyWorktree,
+      business_answers: runState.config.businessAnswers,
       plan_only: runState.config.planOnly,
     },
     slice_plan: runState.slicePlan,
@@ -1984,11 +2473,61 @@ function createWorktreeCommitIfNeeded(runState) {
   }
 
   const commitHash = commitHashResult.stdout.trim();
+  const autoApply = maybeAutoApplyWorktreeCommit(runState, commitHash);
   return {
-    status: "committed",
+    status: autoApply.status === "applied" ? "committed_and_applied" : "committed",
     worktree_path: runState.worktreePath,
     commit: commitHash,
     cherry_pick_command: `git cherry-pick ${commitHash}`,
+    auto_apply: autoApply,
+  };
+}
+
+function maybeAutoApplyWorktreeCommit(runState, commitHash) {
+  if (!runState.config.autoApplyWorktree) {
+    return {
+      status: "disabled",
+      reason: "disabled-by-flag",
+    };
+  }
+
+  const currentHead = getGitHead(runState.repoRoot);
+  if (currentHead !== runState.initialHead) {
+    return {
+      status: "skipped",
+      reason: "source-head-changed",
+      initial_head: runState.initialHead,
+      current_head: currentHead,
+    };
+  }
+
+  const sourceStatus = getGitStatus(runState.repoRoot);
+  if (sourceStatus.trim() !== "") {
+    return {
+      status: "skipped",
+      reason: "source-worktree-not-clean",
+    };
+  }
+
+  const cherryPickResult = runProcess("git", ["cherry-pick", commitHash], {
+    cwd: runState.repoRoot,
+  });
+  if (cherryPickResult.status === 0) {
+    return {
+      status: "applied",
+      reason: "source-clean-and-head-unchanged",
+    };
+  }
+
+  const abortResult = runProcess("git", ["cherry-pick", "--abort"], {
+    cwd: runState.repoRoot,
+  });
+
+  return {
+    status: "failed",
+    reason: "cherry-pick-failed",
+    command_failure: formatCommandFailure(cherryPickResult),
+    abort_status: abortResult.status === 0 ? "aborted" : "abort-failed",
   };
 }
 
@@ -2029,6 +2568,15 @@ function getGitRepoRoot(repoPath) {
   return result.stdout.trim();
 }
 
+function getGitHead(cwd) {
+  const result = runProcess("git", ["rev-parse", "HEAD"], { cwd });
+  if (result.status !== 0) {
+    fail(`Failed to read HEAD in ${cwd}.\n${formatCommandFailure(result)}`);
+  }
+
+  return normalizeWhitespace(result.stdout || "");
+}
+
 function getGitStatus(cwd) {
   const result = runProcess("git", ["status", "--short"], {
     cwd,
@@ -2048,6 +2596,114 @@ function getGitWorkspaceSnapshot(cwd) {
     stagedDiff: getGitDiffSnapshot(cwd, ["--cached"]),
     untrackedFiles: getUntrackedFileSnapshots(cwd),
   };
+}
+
+function getWorkspaceFileStateMap(cwd) {
+  const changedPaths = getChangedWorkspacePaths(cwd);
+  const states = new Map();
+
+  for (const relativePath of changedPaths) {
+    states.set(relativePath, getWorkspaceFileState(cwd, relativePath));
+  }
+
+  return states;
+}
+
+function getChangedWorkspacePaths(cwd) {
+  const result = runProcess("git", ["status", "--porcelain=v1", "-z"], { cwd });
+  if (result.status !== 0) {
+    fail(`Failed to read changed files in ${cwd}.\n${formatCommandFailure(result)}`);
+  }
+
+  const entries = (result.stdout || "").split("\0").filter(Boolean);
+  const paths = new Set();
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    const status = entry.slice(0, 2);
+    const filePath = entry.slice(3);
+    if (!filePath) {
+      continue;
+    }
+
+    if (status.includes("R") || status.includes("C")) {
+      paths.add(toPosixPath(filePath));
+      index += 1;
+      if (entries[index]) {
+        paths.add(toPosixPath(entries[index]));
+      }
+      continue;
+    }
+
+    paths.add(toPosixPath(filePath));
+  }
+
+  return [...paths].sort();
+}
+
+function getWorkspaceFileState(cwd, relativePath) {
+  const absolutePath = path.resolve(cwd, relativePath);
+  const workingTreeState = fs.existsSync(absolutePath)
+    ? fs.lstatSync(absolutePath).isDirectory()
+      ? "directory"
+      : hashFile(absolutePath)
+    : "missing";
+  const unstagedDiff = getGitDiffForPath(cwd, relativePath, []);
+  const stagedDiff = getGitDiffForPath(cwd, relativePath, ["--cached"]);
+
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify({ workingTreeState, unstagedDiff, stagedDiff }))
+    .digest("hex");
+}
+
+function getGitDiffForPath(cwd, relativePath, extraArgs) {
+  const result = runProcess("git", ["diff", "--binary", ...extraArgs, "--", relativePath], { cwd });
+  if (result.status !== 0) {
+    fail(`Failed to read diff for ${relativePath}.\n${formatCommandFailure(result)}`);
+  }
+
+  return result.stdout || "";
+}
+
+function findOutOfScopeFixChanges({ cwd, beforeStates, slice, allowedSupportPaths }) {
+  const afterStates = getWorkspaceFileStateMap(cwd);
+  const allPaths = new Set([...beforeStates.keys(), ...afterStates.keys()]);
+  const changedPaths = [...allPaths].filter((relativePath) => (
+    beforeStates.get(relativePath) !== afterStates.get(relativePath)
+  ));
+  const boundaries = buildAllowedFixBoundaries(slice, allowedSupportPaths);
+
+  if (boundaries.length === 0) {
+    return [];
+  }
+
+  return changedPaths
+    .filter((relativePath) => !isPathAllowedByBoundaries(relativePath, boundaries))
+    .sort();
+}
+
+function buildAllowedFixBoundaries(slice, allowedSupportPaths) {
+  const sliceBoundaries = (slice.paths || []).flatMap((item) => {
+    const normalized = toPosixPath(path.normalize(item)).replace(/\/+$/, "");
+    const parent = normalized.includes("/") ? normalized.slice(0, normalized.lastIndexOf("/")) : normalized;
+    return [normalized, parent].filter(Boolean);
+  });
+
+  return normalizeDistinctStrings([
+    ...sliceBoundaries,
+    ...(allowedSupportPaths || []),
+  ]);
+}
+
+function isPathAllowedByBoundaries(relativePath, boundaries) {
+  const normalizedPath = toPosixPath(path.normalize(relativePath));
+  return boundaries.some((boundary) => {
+    const normalizedBoundary = toPosixPath(path.normalize(boundary)).replace(/\/+$/, "");
+    return (
+      normalizedPath === normalizedBoundary ||
+      normalizedPath.startsWith(`${normalizedBoundary}/`)
+    );
+  });
 }
 
 function getGitDiffSnapshot(cwd, extraArgs) {
@@ -2360,6 +3016,17 @@ function commandExistsOnWindows(command) {
   return result.status === 0;
 }
 
+function commandExists(command) {
+  if (process.platform === "win32") {
+    return commandExistsOnWindows(`${command}.exe`) || commandExistsOnWindows(command);
+  }
+
+  const result = runProcess("/bin/sh", ["-lc", `command -v ${shellQuote(command)}`], {
+    cwd: process.cwd(),
+  });
+  return result.status === 0;
+}
+
 function shouldRetryReviewWithWorkspaceWrite(error, sandbox) {
   if (process.platform !== "win32" || sandbox !== DEFAULT_REVIEW_SANDBOX) {
     return false;
@@ -2520,6 +3187,10 @@ function toPosixPath(value) {
   return value.split(path.sep).join("/");
 }
 
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
 function formatCommandFailure(result) {
   return [
     `error:\n${result.error ? `${result.error.name}: ${result.error.message}` : ""}`,
@@ -2544,7 +3215,25 @@ class SelfIteratingReviewError extends Error {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`${LOG_PREFIX} Unhandled failure: ${error instanceof Error ? error.stack || error.message : String(error)}\n`);
-  process.exitCode = 1;
-});
+function isMainModule() {
+  return process.argv[1] && path.resolve(process.argv[1]) === SCRIPT_PATH;
+}
+
+export {
+  buildBusinessQuestionId,
+  buildFindingFingerprint,
+  buildResumableSliceMap,
+  discoverTestCommands,
+  extractGithubActionsRunCommands,
+  isLikelyVerificationCommand,
+  isPathAllowedByBoundaries,
+  normalizeFinding,
+  resolveScopeBaseRef,
+};
+
+if (isMainModule()) {
+  main().catch((error) => {
+    process.stderr.write(`${LOG_PREFIX} Unhandled failure: ${error instanceof Error ? error.stack || error.message : String(error)}\n`);
+    process.exitCode = 1;
+  });
+}

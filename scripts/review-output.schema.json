@@ -27,6 +27,7 @@
           "why",
           "repro_or_evidence",
           "fix_strategy",
+          "dedupe_key",
           "fingerprint_basis",
           "requires_business_confirmation",
           "business_question"
@@ -82,6 +83,10 @@
             "minLength": 1
           },
           "fix_strategy": {
+            "type": "string",
+            "minLength": 1
+          },
+          "dedupe_key": {
             "type": "string",
             "minLength": 1
           },

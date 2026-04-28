@@ -1,7 +1,7 @@
 interface:
   display_name: "Self Iterating Review"
-  short_description: "Fresh-context multi-round review and auto-fix loop"
-  default_prompt: "Use $self-iterating-review to review a human-confirmed scoped change set in fresh rounds, auto-fix current concrete findings, auto-discover tests when none are provided, and stop when the scope is clean, business confirmation is needed, or the round limit is reached."
+  short_description: "Fresh-context review, fix, test, and resume loop"
+  default_prompt: "Use $self-iterating-review to review a human-confirmed scoped change set in fresh rounds, infer base refs and tests, auto-fix current concrete findings with path guards, resume interrupted runs when needed, and stop when the scope is clean, business confirmation is needed, or the round limit is reached."
 
 policy:
   allow_implicit_invocation: true
