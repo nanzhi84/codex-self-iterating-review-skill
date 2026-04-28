@@ -13,8 +13,10 @@ const DEFAULT_MODE = "auto";
 const DEFAULT_STOP_CONDITION = "current-clean";
 const DEFAULT_FOCUS = ["correctness", "regression", "security"];
 const DEFAULT_CODEX_TIMEOUT_MS = 60 * 60 * 1000;
+const DEFAULT_TEST_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_CHILD_REASONING_EFFORT = "medium";
 const DEFAULT_SEARCH = true;
+const DISCOVERED_TEST_COMMAND_LIMIT = 4;
 const AUTO_SLICE_MAX_FILES = 18;
 const AUTO_SLICE_MAX_CHANGED_LINES = 900;
 const DIFF_CONTEXT_CHAR_LIMIT = 60_000;
@@ -72,9 +74,13 @@ async function runLoop(context) {
     fail("`--mode worktree` requires a clean repository because uncommitted changes are not copied into the detached worktree.");
   }
 
+  config.testPlan = resolveTestPlan(config, repoRoot);
+
   const runId = buildRunId(repoName);
   const runDir = path.join(RUNS_ROOT, runId);
   fs.mkdirSync(runDir, { recursive: true });
+  const testPlanPath = path.join(runDir, "test-plan.json");
+  writeJson(testPlanPath, config.testPlan);
 
   const target = config.planOnly
     ? { cwd: repoRoot, worktreePath: null }
@@ -120,6 +126,7 @@ async function runLoop(context) {
       runDir,
       reviewSchema: REVIEW_SCHEMA_PATH,
       fixSchema: FIX_SCHEMA_PATH,
+      testPlan: testPlanPath,
     },
   };
 
@@ -133,6 +140,11 @@ async function runLoop(context) {
   if (reviewSlices.length > 1) {
     log(`Auto-sliced review into ${reviewSlices.length} scope(s).`);
   }
+  if (config.tests.length > 0) {
+    log(`Using ${config.tests.length} test command(s) from ${config.testPlan.source}.`);
+  } else {
+    log("No test commands were provided or discovered; continuing with review-only verification.");
+  }
 
   if (config.planOnly) {
     return buildPlanOnlyReport(runState);
@@ -140,7 +152,12 @@ async function runLoop(context) {
 
   if (config.tests.length > 0) {
     log("Running baseline tests before the review loop.");
-    runState.baselineTests = runTests(config.tests, runState.targetCwd, path.join(runDir, "baseline-tests"));
+    runState.baselineTests = runTests(
+      config.tests,
+      runState.targetCwd,
+      path.join(runDir, "baseline-tests"),
+      config.testTimeoutMs,
+    );
   }
 
   for (const slice of reviewSlices) {
@@ -188,6 +205,8 @@ function parseArgs(argv) {
     planOnly: false,
     search: DEFAULT_SEARCH,
     codexTimeoutMs: DEFAULT_CODEX_TIMEOUT_MS,
+    testTimeoutMs: DEFAULT_TEST_TIMEOUT_MS,
+    testPlan: null,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -226,6 +245,9 @@ function parseArgs(argv) {
         break;
       case "--codex-timeout-ms":
         config.codexTimeoutMs = Number.parseInt(readRequiredValue(argv, ++index, "--codex-timeout-ms"), 10);
+        break;
+      case "--test-timeout-ms":
+        config.testTimeoutMs = Number.parseInt(readRequiredValue(argv, ++index, "--test-timeout-ms"), 10);
         break;
       case "--allow-no-tests":
         config.allowNoTests = true;
@@ -275,8 +297,8 @@ function validateConfig(config) {
     fail("`--codex-timeout-ms` must be an integer greater than or equal to 10000.");
   }
 
-  if (!config.planOnly && !config.allowNoTests && config.tests.length === 0) {
-    fail("At least one `--test` command is required unless `--allow-no-tests` is explicitly set.");
+  if (!Number.isInteger(config.testTimeoutMs) || config.testTimeoutMs < 10000) {
+    fail("`--test-timeout-ms` must be an integer greater than or equal to 10000.");
   }
 }
 
@@ -287,7 +309,7 @@ function printHelp() {
     "",
     "Required:",
     "  --scope <text>              Review boundary in one concrete sentence",
-    "  --test <command>            Repeatable test command unless --allow-no-tests is used",
+    "  --test <command>            Repeatable test command; auto-discovered when omitted",
     "",
     "Options:",
     "  --repo <path>               Repository path (default: current directory)",
@@ -299,12 +321,226 @@ function printHelp() {
     "  --extra-instruction <text>  Extra instruction for review and fix prompts",
     "  --model <name>              Optional model override for codex exec",
     `  --codex-timeout-ms <ms>     Per-run timeout for codex exec (default: ${DEFAULT_CODEX_TIMEOUT_MS})`,
+    `  --test-timeout-ms <ms>      Per-command test timeout (default: ${DEFAULT_TEST_TIMEOUT_MS})`,
     "  --search                    Request live web search in codex exec when supported (default: requested)",
-    "  --allow-no-tests            Skip the explicit test requirement",
+    "  --allow-no-tests            Skip automatic test discovery",
     "  --plan-only                 Print the resolved base + auto-slice plan without launching Codex",
   ];
 
   process.stdout.write(`${lines.join("\n")}\n`);
+}
+
+function resolveTestPlan(config, repoRoot) {
+  if (config.tests.length > 0) {
+    return {
+      source: "explicit",
+      confidence: "high",
+      commands: config.tests,
+      notes: ["Using test commands provided with --test."],
+    };
+  }
+
+  if (config.allowNoTests) {
+    return {
+      source: "disabled",
+      confidence: "none",
+      commands: [],
+      notes: ["--allow-no-tests was set, so automatic test discovery was skipped."],
+    };
+  }
+
+  const discoveredPlan = discoverTestCommands(repoRoot);
+  config.tests = normalizeDistinctStrings(discoveredPlan.commands).slice(0, DISCOVERED_TEST_COMMAND_LIMIT);
+
+  return {
+    ...discoveredPlan,
+    commands: config.tests,
+  };
+}
+
+function discoverTestCommands(repoRoot) {
+  const candidates = [];
+  const notes = [];
+  const seenCommands = new Set();
+
+  function addCandidate(command, confidence, reason) {
+    const normalizedCommand = normalizeWhitespace(command);
+    if (!normalizedCommand || seenCommands.has(normalizedCommand)) {
+      return;
+    }
+
+    seenCommands.add(normalizedCommand);
+    candidates.push({
+      command: normalizedCommand,
+      confidence,
+      reason,
+    });
+  }
+
+  discoverNodeTestCommands(repoRoot, addCandidate, notes);
+  discoverPythonTestCommands(repoRoot, addCandidate, notes);
+  discoverGoTestCommands(repoRoot, addCandidate, notes);
+  discoverRustTestCommands(repoRoot, addCandidate, notes);
+  discoverDotnetTestCommands(repoRoot, addCandidate, notes);
+  discoverMakeTestCommands(repoRoot, addCandidate, notes);
+
+  const commands = candidates.map((candidate) => candidate.command);
+  const confidence = candidates.some((candidate) => candidate.confidence === "high")
+    ? "high"
+    : candidates.length > 0
+      ? "medium"
+      : "none";
+
+  if (commands.length === 0) {
+    notes.push("No common test command was discovered from repository metadata.");
+  }
+
+  return {
+    source: "auto-discovered",
+    confidence,
+    commands,
+    candidates,
+    notes,
+  };
+}
+
+function discoverNodeTestCommands(repoRoot, addCandidate, notes) {
+  const packageJsonPath = path.join(repoRoot, "package.json");
+  if (!fs.existsSync(packageJsonPath)) {
+    return;
+  }
+
+  const packageJson = readJsonFile(packageJsonPath);
+  const scripts = packageJson?.scripts && typeof packageJson.scripts === "object"
+    ? packageJson.scripts
+    : {};
+  const packageManager = detectPackageManager(repoRoot);
+  const scriptNames = ["test", "lint", "typecheck", "check"];
+
+  for (const scriptName of scriptNames) {
+    if (!isUsefulPackageScript(scripts[scriptName])) {
+      continue;
+    }
+
+    addCandidate(
+      buildPackageScriptCommand(packageManager, scriptName),
+      scriptName === "test" ? "high" : "medium",
+      `package.json script "${scriptName}"`,
+    );
+  }
+
+  if (Object.keys(scripts).length === 0) {
+    notes.push("package.json exists but does not define scripts.");
+  }
+}
+
+function discoverPythonTestCommands(repoRoot, addCandidate) {
+  const hasPytestConfig =
+    fs.existsSync(path.join(repoRoot, "pytest.ini")) ||
+    fs.existsSync(path.join(repoRoot, "tox.ini")) ||
+    fs.existsSync(path.join(repoRoot, "pyproject.toml")) ||
+    fs.existsSync(path.join(repoRoot, "setup.cfg"));
+
+  if (hasPytestConfig) {
+    addCandidate("python -m pytest", "high", "Python test configuration");
+  }
+}
+
+function discoverGoTestCommands(repoRoot, addCandidate) {
+  if (fs.existsSync(path.join(repoRoot, "go.mod"))) {
+    addCandidate("go test ./...", "high", "go.mod");
+  }
+}
+
+function discoverRustTestCommands(repoRoot, addCandidate) {
+  if (fs.existsSync(path.join(repoRoot, "Cargo.toml"))) {
+    addCandidate("cargo test", "high", "Cargo.toml");
+  }
+}
+
+function discoverDotnetTestCommands(repoRoot, addCandidate) {
+  const rootFiles = listRootFiles(repoRoot);
+  if (rootFiles.some((fileName) => fileName.endsWith(".sln") || fileName.endsWith(".csproj"))) {
+    addCandidate("dotnet test", "high", ".NET project file");
+  }
+}
+
+function discoverMakeTestCommands(repoRoot, addCandidate) {
+  const makefilePath = path.join(repoRoot, "Makefile");
+  if (fs.existsSync(makefilePath) && /^test\s*:/m.test(readTextFile(makefilePath))) {
+    addCandidate("make test", "medium", "Makefile test target");
+  }
+
+  const justfilePath = path.join(repoRoot, "justfile");
+  if (fs.existsSync(justfilePath) && /^test\s*:/m.test(readTextFile(justfilePath))) {
+    addCandidate("just test", "medium", "justfile test recipe");
+  }
+}
+
+function detectPackageManager(repoRoot) {
+  if (fs.existsSync(path.join(repoRoot, "pnpm-lock.yaml")) || fs.existsSync(path.join(repoRoot, "pnpm-workspace.yaml"))) {
+    return "pnpm";
+  }
+
+  if (fs.existsSync(path.join(repoRoot, "yarn.lock"))) {
+    return "yarn";
+  }
+
+  if (fs.existsSync(path.join(repoRoot, "bun.lockb")) || fs.existsSync(path.join(repoRoot, "bun.lock"))) {
+    return "bun";
+  }
+
+  return "npm";
+}
+
+function buildPackageScriptCommand(packageManager, scriptName) {
+  if (scriptName === "test") {
+    if (packageManager === "bun") {
+      return "bun run test";
+    }
+
+    return `${packageManager} test`;
+  }
+
+  return `${packageManager} run ${scriptName}`;
+}
+
+function isUsefulPackageScript(script) {
+  if (typeof script !== "string" || !script.trim()) {
+    return false;
+  }
+
+  const normalizedScript = script.toLowerCase();
+  return !(
+    normalizedScript.includes("no test specified") ||
+    normalizedScript.includes("echo") && normalizedScript.includes("exit 1")
+  );
+}
+
+function readJsonFile(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function readTextFile(filePath) {
+  try {
+    return fs.readFileSync(filePath, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function listRootFiles(repoRoot) {
+  try {
+    return fs.readdirSync(repoRoot, { withFileTypes: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
 }
 
 function prepareTargetWorkspace({ config, repoRoot, runDir }) {
@@ -432,6 +668,7 @@ async function runSliceLoop({ config, runState, slice }) {
         config.tests,
         runState.targetCwd,
         path.join(roundDir, "tests"),
+        config.testTimeoutMs,
       );
       previousFailedTests = roundRecord.tests.filter((test) => test.status !== "passed");
       if (previousFailedTests.length === 0) {
@@ -480,6 +717,7 @@ async function runSliceLoop({ config, runState, slice }) {
         config.tests,
         runState.targetCwd,
         path.join(roundDir, "tests"),
+        config.testTimeoutMs,
       );
       previousFailedTests = roundRecord.tests.filter((test) => test.status !== "passed");
     }
@@ -875,27 +1113,41 @@ function buildFailedTestPromptLines(failedTests) {
   }
 
   return failedTests.map((test) => (
-    `- ${test.command}: ${test.status}; stdout tail: ${truncate(test.stdoutTail || "")}; stderr tail: ${truncate(test.stderrTail || "")}`
+    `- ${test.command}: ${test.status}; stdout log: ${test.stdoutPath || "n/a"}; stderr log: ${test.stderrPath || "n/a"}; stdout tail: ${truncate(test.stdoutTail || "")}; stderr tail: ${truncate(test.stderrTail || "")}`
   ));
 }
 
-function runTests(commands, cwd, outputDir) {
+function runTests(commands, cwd, outputDir, timeoutMs) {
   fs.mkdirSync(outputDir, { recursive: true });
 
   return commands.map((command, index) => {
     const startedAt = Date.now();
-    const result = runShellCommand(command, cwd);
+    const result = runShellCommand(command, cwd, timeoutMs);
     const durationMs = Date.now() - startedAt;
+    const testId = `test-${String(index + 1).padStart(2, "0")}`;
+    const stdoutPath = path.join(outputDir, `${testId}.stdout.log`);
+    const stderrPath = path.join(outputDir, `${testId}.stderr.log`);
+    const timedOut = result.error?.code === "ETIMEDOUT";
+    const passed = !timedOut && (result.status ?? 1) === 0;
+
+    fs.writeFileSync(stdoutPath, result.stdout || "", "utf8");
+    fs.writeFileSync(stderrPath, result.stderr || "", "utf8");
+
     const record = {
       command,
-      exitCode: result.status ?? 1,
-      status: (result.status ?? 1) === 0 ? "passed" : "failed",
+      exitCode: result.status,
+      signal: result.signal ?? null,
+      status: timedOut ? "timed-out" : passed ? "passed" : "failed",
+      timedOut,
+      timeoutMs,
       durationMs,
+      stdoutPath,
+      stderrPath,
       stdoutTail: truncate(result.stdout || ""),
       stderrTail: truncate(result.stderr || ""),
     };
 
-    const filePath = path.join(outputDir, `test-${String(index + 1).padStart(2, "0")}.json`);
+    const filePath = path.join(outputDir, `${testId}.json`);
     writeJson(filePath, record);
     return record;
   });
@@ -964,6 +1216,8 @@ function buildFinalReport(runState) {
       max_rounds: runState.config.maxRounds,
       stop_condition: runState.config.stopCondition,
       tests: runState.config.tests,
+      test_plan: runState.config.testPlan,
+      test_timeout_ms: runState.config.testTimeoutMs,
       paths: runState.config.paths,
       focus: runState.config.focus,
       extra_instructions: runState.config.extraInstructions,
@@ -1219,6 +1473,7 @@ function buildFailureReport(error, runState) {
       stderr_log: details.stderrPath ?? null,
       structured_output: details.outputPath ?? null,
     },
+    test_plan: runState?.config?.testPlan ?? null,
     baseline_tests: runState?.baselineTests ?? [],
     slice_plan: runState?.slicePlan ?? [],
     slices: runState?.slices ?? [],
@@ -1671,6 +1926,8 @@ function buildPlanOnlyReport(runState) {
       max_rounds: runState.config.maxRounds,
       stop_condition: runState.config.stopCondition,
       tests: runState.config.tests,
+      test_plan: runState.config.testPlan,
+      test_timeout_ms: runState.config.testTimeoutMs,
       paths: runState.config.paths,
       focus: runState.config.focus,
       extra_instructions: runState.config.extraInstructions,
@@ -1862,13 +2119,13 @@ function hashFile(filePath) {
   return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
 }
 
-function runShellCommand(command, cwd) {
+function runShellCommand(command, cwd, timeoutMs) {
   if (process.platform === "win32") {
     const shell = getWindowsTestShell();
-    return runProcess(shell.command, [...shell.args, command], { cwd });
+    return runProcess(shell.command, [...shell.args, command], { cwd, timeout: timeoutMs });
   }
 
-  return runProcess("/bin/sh", ["-lc", command], { cwd });
+  return runProcess("/bin/sh", ["-lc", command], { cwd, timeout: timeoutMs });
 }
 
 function runProcess(command, args, options = {}) {

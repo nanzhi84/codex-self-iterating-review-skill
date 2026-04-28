@@ -1,6 +1,6 @@
 # self-iterating-review
 
-`self-iterating-review` is a Codex skill for running multi-round review loops in fresh contexts. Each review round is executed with `codex exec --ephemeral`, so the reviewer does not inherit the current thread state. The loop can review a scoped change set, surface current findings, launch a separate fresh fixing run, execute explicit test commands, and stop when the scope is clean, business confirmation is needed, or when a round limit is reached.
+`self-iterating-review` is a Codex skill for running multi-round review loops in fresh contexts. Each review round is executed with `codex exec --ephemeral`, so the reviewer does not inherit the current thread state. The loop can review a scoped change set, surface current findings, launch a separate fresh fixing run, execute explicit or auto-discovered test commands, and stop when the scope is clean, business confirmation is needed, or when a round limit is reached.
 
 The repository contains two layers:
 
@@ -11,6 +11,7 @@ The repository contains two layers:
 
 - Runs review rounds in fresh non-interactive Codex sessions.
 - Requests live web search using the flag position supported by the installed Codex CLI.
+- Auto-discovers common test commands when none are provided.
 - Fixes concrete `P1` through `P4` findings.
 - Stops and reports questions when a finding depends on unclear business semantics.
 - Keeps review rounds read-only by default; if Windows requires a writable sandbox, the supervisor checks a Git workspace snapshot afterward.
@@ -67,8 +68,6 @@ Run the supervisor directly. This example uses PowerShell line continuation:
 node "<skill-dir>/scripts/review_loop.mjs" `
   --scope "Review the current branch diff against origin/main for concrete correctness, regression, and security defects." `
   --path "src" `
-  --test "pnpm test" `
-  --test "pnpm lint" `
   --mode "auto" `
   --max-rounds "6"
 ```
@@ -79,8 +78,6 @@ On macOS or Linux, use shell line continuation instead:
 node "<skill-dir>/scripts/review_loop.mjs" \
   --scope "Review the current branch diff against origin/main for concrete correctness, regression, and security defects." \
   --path "src" \
-  --test "pnpm test" \
-  --test "pnpm lint" \
   --mode "auto" \
   --max-rounds "6"
 ```
@@ -88,13 +85,14 @@ node "<skill-dir>/scripts/review_loop.mjs" \
 ### Important Flags
 
 - `--scope`: one concrete sentence describing the review boundary
-- `--test`: repeatable explicit test command
+- `--test`: repeatable explicit test command; auto-discovered when omitted
 - `--path`: repeatable hard path boundary inside the repository
 - `--mode auto|in-place|worktree`: choose automatic behavior, the current checkout, or a detached worktree; default is `auto`
 - `--max-rounds`: upper bound for the loop
 - `--stop-condition current-clean|no-new-p1p2`: choose the stop rule
 - `--allow-no-tests`: allow a no-test run only when explicitly desired
 - `--codex-timeout-ms`: per-run timeout for each fresh Codex session
+- `--test-timeout-ms`: per-command test timeout; default is 30 minutes
 - `--search`: request live web search when the installed Codex CLI exposes a supported flag position
 
 ## Output
@@ -108,6 +106,7 @@ Each run creates a timestamped directory under:
 Typical artifacts include:
 
 - baseline test results
+- auto-discovered or explicit test plan
 - per-round review stdout/stderr logs
 - per-round structured review output
 - per-round structured fix output

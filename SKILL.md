@@ -7,7 +7,7 @@ description: Run a multi-round fresh-context code review loop for a Git reposito
 
 ## Overview
 
-Use this skill when the user wants Codex to keep reviewing the same scoped change set in fresh non-interactive runs, fix current defects, run explicit test commands, and stop only when the scoped code is clean, a finding requires business clarification, or the loop hits a configured round limit.
+Use this skill when the user wants Codex to keep reviewing the same scoped change set in fresh non-interactive runs, fix current defects, run explicit or auto-discovered test commands, and stop only when the scoped code is clean, a finding requires business clarification, or the loop hits a configured round limit.
 
 This skill delegates the loop to the bundled supervisor script:
 
@@ -24,11 +24,14 @@ On Windows, the supervisor disables PowerShell profile loading for child `codex 
 Collect or confirm only these inputs:
 
 - `scope`: required. A concrete sentence that describes exactly what should be reviewed.
-- `test commands`: required unless the user explicitly allows a no-test run.
+- `test commands`: optional. Use user-provided commands when present; otherwise let the supervisor auto-discover tests from repository metadata.
 - `max rounds`: optional. Default `6`.
 - `mode`: optional. Default `auto`. In `auto`, use the current checkout when it is already a linked worktree or has uncommitted changes; otherwise create a detached worktree for a clean main checkout. Use explicit `worktree` only when you want another isolated detached worktree.
+- `test timeout`: optional. Default 30 minutes per test command.
 
-If the user does not provide test commands, ask once. Do not silently invent them.
+If the user does not provide a clear `scope`, ask one short question before running. Do not infer the review boundary from repository state when the human intent is ambiguous.
+
+Do not ask for test commands by default. The supervisor discovers common commands from files such as `package.json`, `pyproject.toml`, `pytest.ini`, `go.mod`, `Cargo.toml`, `.sln`, `Makefile`, and `justfile`. If no command is discovered, the loop continues without test verification and records that limitation in the final JSON.
 
 ## Scope Rules
 
@@ -60,6 +63,15 @@ If the first review round times out or stalls before producing structured output
 
 Live web search should be used for child review runs when the local Codex CLI supports it. The supervisor requests `--search` by default, detects whether the installed CLI exposes it as a global flag or an `exec` flag, and uses the supported position. If the installed CLI does not expose that flag, the loop continues without passing it and logs that limitation instead of failing before review starts.
 
+## Timeout Policy
+
+Treat timeouts as hang protection, not speed optimization. Codex review and fix rounds are expected to be slow.
+
+- Child `codex exec` runs default to 60 minutes.
+- Each test command defaults to 30 minutes.
+- If a child Codex run times out, narrow the slice before increasing the timeout.
+- If a test command times out, keep the full stdout/stderr logs, mark the test as `timed-out`, and carry it into the next review/fix prompt as evidence.
+
 ## Severity and Business Rubric
 
 `P1` through `P4` findings belong in this loop when they are concrete and technically fixable.
@@ -78,7 +90,7 @@ If a finding depends on unclear product policy or business semantics, do not inv
 1. Verify that the target directory is a Git repository.
 2. Build one concrete `--scope` string.
 3. Choose `--mode auto`, `--mode in-place`, or `--mode worktree`; omit it only when the default `auto` behavior is intended.
-4. Pass every explicit test command with its own `--test`.
+4. Pass explicit test commands with `--test` only when the user supplied them or when you have a strong reason to override auto-discovery.
 5. Optional: use `--plan-only` first when you want to inspect the resolved base and auto-slice plan without launching child Codex runs.
 6. Run the script.
 7. Read the final JSON printed to stdout and summarize:
@@ -101,8 +113,6 @@ In-place review for uncommitted work:
 node "<skill-dir>/scripts/review_loop.mjs" `
   --scope "Review the current uncommitted changes under src/auth for correctness, regression, and security issues." `
   --path "src/auth" `
-  --test "pnpm test -- auth" `
-  --test "pnpm lint" `
   --mode "in-place"
 ```
 
@@ -111,15 +121,23 @@ Detached worktree review for a clean repo:
 ```powershell
 node "<skill-dir>/scripts/review_loop.mjs" `
   --scope "Review the current branch diff against origin/main for concrete correctness issues." `
-  --test "pnpm test" `
-  --test "pnpm lint" `
   --mode "auto" `
   --max-rounds "6"
 ```
 
 When the current checkout is already a linked worktree, default `auto` mode does not create another worktree. It runs in-place inside that existing worktree.
 
-If the user explicitly approves skipping tests, add `--allow-no-tests`.
+If the user gives explicit tests, pass each one:
+
+```powershell
+node "<skill-dir>/scripts/review_loop.mjs" `
+  --scope "Review the current branch diff against origin/main for concrete correctness issues." `
+  --test "pnpm test" `
+  --test "pnpm lint" `
+  --mode "auto"
+```
+
+If the user explicitly wants no test discovery, add `--allow-no-tests`.
 
 Plan-only dry run:
 
@@ -127,19 +145,18 @@ Plan-only dry run:
 node "<skill-dir>/scripts/review_loop.mjs" `
   --scope "Review the current branch diff against main for concrete correctness issues." `
   --mode "in-place" `
-  --allow-no-tests `
   --plan-only
 ```
 
 ## Output Expectations
 
-The script writes per-round debug artifacts under `~/.codex/tmp/self-iterating-review/...` and never writes reports into the repository. The final result is printed to stdout as JSON and includes the run configuration, per-round review and fix summaries, test results, remaining findings, business questions, worktree handoff details, and the artifact paths.
+The script writes per-round debug artifacts under `~/.codex/tmp/self-iterating-review/...` and never writes reports into the repository. The final result is printed to stdout as JSON and includes the run configuration, test discovery plan, per-round review and fix summaries, test results, remaining findings, business questions, worktree handoff details, and the artifact paths.
 
 The supervisor forces child `codex exec` runs to use a moderate reasoning effort so the loop does not inherit an overly slow global CLI default such as `model_reasoning_effort = "xhigh"`.
 
 Review rounds run with a read-only sandbox by default. If a Windows Codex CLI rejects that sandbox mode, the supervisor retries with `workspace-write` but fails the run if the review round changes the Git working tree.
 
-When post-fix tests fail, the loop carries those failures into the next review and fix prompts as high-priority evidence. The next round should fix the underlying cause when it is inside scope.
+When baseline or post-fix tests fail or time out, the loop carries those failures and full log paths into the next review and fix prompts as high-priority evidence. The next round should fix the underlying cause when it is inside scope.
 
 When `worktree` mode finishes with code changes, the supervisor stages those changes in the detached worktree and creates a handoff commit. The final JSON includes the commit hash and the `git cherry-pick <commit>` command to apply the fix on the original branch.
 
