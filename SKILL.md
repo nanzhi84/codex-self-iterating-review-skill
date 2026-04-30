@@ -7,7 +7,7 @@ description: Run a multi-round fresh-context code review loop for a Git reposito
 
 ## Overview
 
-Use this skill when the user wants Codex to keep reviewing the same scoped change set in fresh non-interactive runs, fix current defects, infer mechanical details such as base refs and test commands, and stop only when the scoped code is clean, a finding requires business clarification, or the loop hits a configured round limit.
+Use this skill when the user wants Codex to keep reviewing the same scoped change set in fresh non-interactive runs, fix current defects, infer mechanical details such as base refs and test commands, and stop only when the scoped code is clean, a finding requires business clarification, repeated repair is no longer making progress, or the loop hits a configured round limit.
 
 This skill delegates the loop to the bundled supervisor script:
 
@@ -77,6 +77,14 @@ Treat timeouts as hang protection, not speed optimization. Codex review and fix 
 - If a child Codex run times out, narrow the slice before increasing the timeout.
 - If a test command times out, keep the full stdout/stderr logs, mark the test as `timed-out`, and carry it into the next review/fix prompt as evidence.
 
+## Repeated Repair Policy
+
+The supervisor records a ledger of every finding fingerprint across rounds. Fix rounds must report one `finding_results` entry per active finding, including the finding fingerprint, whether it was fixed, partially fixed, blocked, invalid, needs business confirmation, or made no progress, plus the reason.
+
+The next review and fix prompts receive compressed historical finding memory, not only the previous round. This includes open and stalled findings first, then recently fixed findings with their final repair summary. Full ledger details stay in the JSON report; prompts receive only bounded summaries so they do not grow without limit.
+
+Stop with `stalled-repair` when the same finding repeatedly survives fix attempts, when a fix round reports `no_progress`, `blocked`, `invalid`, or `needs_business_confirmation`, or when the same active finding set reappears after a no-progress fix. In that case, do not keep spending rounds on the same repair loop. Return the stalled findings, their appearances, and their fix attempts in the final report so the human can decide whether to clarify business rules, change scope, or inspect the attempted fixes.
+
 ## Severity and Business Rubric
 
 `P1` through `P4` findings belong in this loop when they are concrete and technically fixable.
@@ -106,6 +114,7 @@ If a finding depends on unclear product policy or business semantics, do not inv
    - which findings were fixed
    - which findings remain, if any
    - which business questions need human confirmation, if any, including their `question_id`
+   - whether the loop stopped on `stalled-repair`, including the repeated finding fingerprints and the last fix reasons
    - whether tests stayed green
    - the worktree handoff commit, auto-apply result, and `git cherry-pick <commit>` command when `worktree` mode created fixes
    - where the run artifacts live
@@ -165,7 +174,7 @@ node "<skill-dir>/scripts/review_loop.mjs" `
 
 ## Output Expectations
 
-The script writes per-round debug artifacts under `~/.codex/tmp/self-iterating-review/...` and never writes reports into the repository. The final result is printed to stdout and saved as JSON. It includes the run configuration, base-ref resolution, test discovery plan, per-round review and fix summaries, test results, remaining findings, business questions, worktree handoff details, and the artifact paths.
+The script writes per-round debug artifacts under `~/.codex/tmp/self-iterating-review/...` and never writes reports into the repository. The final result is printed to stdout and saved as JSON. It includes the run configuration, base-ref resolution, test discovery plan, per-round review and fix summaries, per-finding fix results, stalled repair details, test results, remaining findings, business questions, worktree handoff details, and the artifact paths.
 
 The supervisor forces child `codex exec` runs to use a moderate reasoning effort so the loop does not inherit an overly slow global CLI default such as `model_reasoning_effort = "xhigh"`.
 
@@ -183,7 +192,7 @@ When the scope is a clean branch diff against `main` or `origin/main`, the super
 - records base-ref candidates and the chosen reason
 - computes a diff-based slice plan before the first child review run
 - auto-splits oversized diffs into smaller file batches, grouped by top-level area when possible
-- embeds a bounded diff summary and patch excerpt into each child review prompt
+- embeds only bounded diff summaries into child prompts, including changed files, line counts, and diff stat highlights; patch bodies are intentionally omitted from prompts
 
 Use `--plan-only` to inspect that plan without spending review tokens.
 

@@ -6,6 +6,7 @@
     "status",
     "summary",
     "changed_files",
+    "finding_results",
     "notes"
   ],
   "properties": {
@@ -27,6 +28,44 @@
       "items": {
         "type": "string",
         "minLength": 1
+      }
+    },
+    "finding_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "fingerprint",
+          "status",
+          "summary",
+          "reason"
+        ],
+        "properties": {
+          "fingerprint": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "fixed",
+              "partially_fixed",
+              "blocked",
+              "invalid",
+              "needs_business_confirmation",
+              "no_progress"
+            ]
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
       }
     },
     "notes": {

@@ -21,10 +21,23 @@ const AUTO_BASE_CANDIDATE_LIMIT = 8;
 const AUTO_SLICE_MAX_FILES = 18;
 const AUTO_SLICE_MAX_CHANGED_LINES = 900;
 const DIFF_CONTEXT_CHAR_LIMIT = 60_000;
+const DIFF_PROMPT_FILE_LIMIT = 24;
+const DIFF_PROMPT_STAT_LINE_LIMIT = 18;
+const REPAIR_HISTORY_PROMPT_LIMIT = 16;
+const OPEN_REPAIR_HISTORY_PROMPT_LIMIT = 10;
+const FIXED_REPAIR_HISTORY_PROMPT_LIMIT = 6;
 const BINARY_FILE_CHANGED_LINE_FALLBACK = 50;
 const CHILD_FORCE_KILL_GRACE_MS = 5_000;
 const WINDOWS_REVIEW_SANDBOX = "workspace-write";
 const DEFAULT_REVIEW_SANDBOX = "read-only";
+const STALLED_FINDING_APPEARANCE_LIMIT = 3;
+const STALLED_FINDING_RESULT_STATUSES = new Set([
+  "blocked",
+  "invalid",
+  "needs_business_confirmation",
+  "no_progress",
+]);
+const STALLED_FIX_STATUSES = new Set(["blocked", "no-op"]);
 const LOG_PREFIX = "[self-iterating-review]";
 const OUTPUT_TAIL_LIMIT = 4000;
 
@@ -190,11 +203,14 @@ async function runLoop(context) {
   runState.finalActiveFindings = deduplicateFindings(
     runState.slices.flatMap((slice) => slice.finalActiveFindings),
   );
+  const sliceStopReasons = new Set(runState.slices.map((slice) => slice.stopReason));
   runState.stopReason =
     runState.finalActiveFindings.length === 0
       ? "clean"
       : runState.finalActiveFindings.some((finding) => finding.requiresBusinessConfirmation)
         ? "blocked-by-business-questions"
+        : sliceStopReasons.has("stalled-repair")
+          ? "stalled-repair"
       : "completed-with-findings";
   runState.finalStatus = deriveFinalStatus(
     runState.stopReason,
@@ -881,6 +897,7 @@ async function runSliceLoop({ config, runState, slice }) {
       roundDir,
       targetCwd: runState.targetCwd,
       previousFailedTests,
+      findingLedger: runState.allFindingsByFingerprint,
     });
 
     const currentFindings = reviewResult.findings;
@@ -895,6 +912,13 @@ async function runSliceLoop({ config, runState, slice }) {
       currentFindings,
       globalRoundNumber,
     );
+    const previousRound = rounds.length >= 1 ? rounds[rounds.length - 1] : null;
+    markResolvedFindingsAfterReview({
+      ledger: runState.allFindingsByFingerprint,
+      previousRound,
+      currentFindings,
+      roundNumber: globalRoundNumber,
+    });
 
     const roundRecord = {
       sliceId: slice.id,
@@ -954,6 +978,18 @@ async function runSliceLoop({ config, runState, slice }) {
       break;
     }
 
+    const stalledRepair = detectStalledRepair({
+      ledger: runState.allFindingsByFingerprint,
+      activeFindings,
+      previousRound,
+    });
+    if (stalledRepair) {
+      roundRecord.stalledRepair = stalledRepair;
+      stopReason = "stalled-repair";
+      log(`Slice ${slice.label}: stopping because repeated repair made no progress.`);
+      break;
+    }
+
     if (roundNumber === config.maxRounds) {
       stopReason = "max-rounds";
       break;
@@ -972,7 +1008,25 @@ async function runSliceLoop({ config, runState, slice }) {
       activeFindings,
       baselineTests: runState.baselineTests,
       previousFailedTests,
+      findingLedger: runState.allFindingsByFingerprint,
     });
+    recordFixAttemptForFindings(
+      runState.allFindingsByFingerprint,
+      activeFindings,
+      roundRecord.fix,
+      globalRoundNumber,
+    );
+
+    const immediateStalledRepair = detectNoProgressRepairAfterFix({
+      activeFindings,
+      fixResult: roundRecord.fix,
+    });
+    if (immediateStalledRepair) {
+      roundRecord.stalledRepair = immediateStalledRepair;
+      stopReason = "stalled-repair";
+      log(`Slice ${slice.label}: stopping because the fix round reported no repair progress.`);
+      break;
+    }
 
     if (config.tests.length > 0) {
       log(`Slice ${slice.label}: running post-fix tests.`);
@@ -1007,6 +1061,7 @@ async function runReviewRound({
   roundDir,
   targetCwd,
   previousFailedTests,
+  findingLedger,
 }) {
   const outputPath = path.join(roundDir, "review-output.json");
   const initialWorkspaceSnapshot = getGitWorkspaceSnapshot(targetCwd);
@@ -1016,6 +1071,7 @@ async function runReviewRound({
     roundNumber,
     globalRoundNumber,
     previousFailedTests,
+    findingLedger,
   });
   const parsed = await runReviewCodexStructured({
     cwd: targetCwd,
@@ -1060,6 +1116,7 @@ async function runFixRound({
   activeFindings,
   baselineTests,
   previousFailedTests,
+  findingLedger,
 }) {
   const outputPath = path.join(roundDir, "fix-output.json");
   const initialFileStates = getWorkspaceFileStateMap(targetCwd);
@@ -1071,6 +1128,7 @@ async function runFixRound({
     activeFindings,
     baselineTests,
     previousFailedTests,
+    findingLedger,
   });
 
   const parsed = await runCodexStructured({
@@ -1084,6 +1142,11 @@ async function runFixRound({
     timeoutMs: config.codexTimeoutMs,
     phase: "fix",
     roundNumber,
+  });
+  validateFixFindingResults(parsed, activeFindings, {
+    outputPath,
+    roundNumber,
+    targetCwd,
   });
 
   const changedOutsideScope = findOutOfScopeFixChanges({
@@ -1258,6 +1321,7 @@ function buildReviewPrompt({
   roundNumber,
   globalRoundNumber,
   previousFailedTests,
+  findingLedger,
 }) {
   const pathLines = slice.paths.length === 0
     ? ["- No hard path filter. Use the scope sentence as the boundary."]
@@ -1268,6 +1332,7 @@ function buildReviewPrompt({
   const businessAnswerLines = buildBusinessAnswerPromptLines(config.businessAnswers);
   const diffContextLines = buildSliceDiffPromptLines(slice);
   const failedTestLines = buildFailedTestPromptLines(previousFailedTests);
+  const repairHistoryLines = buildRepairHistoryPromptLines(findingLedger);
 
   return [
     `You are running review round ${roundNumber} inside a self-iterating review loop.`,
@@ -1297,12 +1362,16 @@ function buildReviewPrompt({
     "Previously failed tests:",
     ...failedTestLines,
     "",
+    "Historical finding memory:",
+    ...repairHistoryLines,
+    "",
     "Confirmed business answers:",
     ...businessAnswerLines,
     "",
     "Rules:",
     "- You may inspect repository context outside the scope, but only report findings whose root cause is inside the scope.",
     "- Report only current issues that are still present in this checkout.",
+    "- Use historical finding memory to avoid re-reporting a stale issue as new. If a repeated issue is still real, keep the same `dedupe_key` and `fingerprint_basis`.",
     "- Treat previously failed tests as high-priority evidence. If the root cause is in scope, report a finding for it.",
     "- Prefer high-confidence findings. Skip speculation.",
     "- Do not run the full project test suite during the review round. Prefer static inspection and minimal targeted commands.",
@@ -1329,8 +1398,10 @@ function buildFixPrompt({
   activeFindings,
   baselineTests,
   previousFailedTests,
+  findingLedger,
 }) {
   const findingsPayload = activeFindings.map((finding) => ({
+    fingerprint: finding.fingerprint,
     severity: finding.severity,
     title: finding.title,
     file: finding.file,
@@ -1341,6 +1412,7 @@ function buildFixPrompt({
     fix_strategy: finding.fixStrategy,
     dedupe_key: finding.dedupeKey,
     fingerprint_basis: finding.fingerprintBasis,
+    first_seen_round: finding.firstSeenRound,
   }));
 
   const baselineLines = baselineTests.length === 0
@@ -1358,6 +1430,7 @@ function buildFixPrompt({
   const businessAnswerLines = buildBusinessAnswerPromptLines(config.businessAnswers);
   const diffContextLines = buildSliceDiffPromptLines(slice);
   const failedTestLines = buildFailedTestPromptLines(previousFailedTests);
+  const repairHistoryLines = buildRepairHistoryPromptLines(findingLedger);
 
   return [
     `You are fixing the output of review round ${roundNumber} in a self-iterating review loop.`,
@@ -1384,6 +1457,9 @@ function buildFixPrompt({
     "Previously failed tests to prioritize:",
     ...failedTestLines,
     "",
+    "Historical finding memory:",
+    ...repairHistoryLines,
+    "",
     "Confirmed business answers:",
     ...businessAnswerLines,
     "",
@@ -1392,6 +1468,9 @@ function buildFixPrompt({
     "",
     "Rules:",
     "- Fix root causes, not symptoms.",
+    "- For every active finding, include exactly one `finding_results` entry using the finding's `fingerprint`.",
+    "- In `finding_results`, record what you changed and why the issue is or is not fixed. Use `no_progress` when you cannot make a meaningful change.",
+    "- Do not mark a finding as `fixed` unless the root cause was changed. Use `invalid` when the finding is demonstrably false.",
     "- Prioritize fixes for previously failed tests when they are connected to the active findings.",
     "- Keep edits inside the scoped code unless a tiny supporting change outside the scope is required to make the fix correct.",
     "- Do not create documentation files.",
@@ -1423,6 +1502,71 @@ function buildBusinessAnswerPromptLines(businessAnswers) {
   }
 
   return entries.map(([questionId, answer]) => `- ${questionId}: ${answer}`);
+}
+
+function buildRepairHistoryPromptLines(ledger) {
+  const entries = Array.from(ledger?.values?.() || [])
+    .filter(hasPromptWorthyFindingHistory)
+    .sort(compareFindingMemoryEntries);
+
+  if (entries.length === 0) {
+    return ["- None."];
+  }
+
+  const openEntries = entries
+    .filter((entry) => entry.status !== "fixed")
+    .slice(0, OPEN_REPAIR_HISTORY_PROMPT_LIMIT);
+  const fixedEntries = entries
+    .filter((entry) => entry.status === "fixed")
+    .slice(0, FIXED_REPAIR_HISTORY_PROMPT_LIMIT);
+  const selectedEntries = [...openEntries, ...fixedEntries]
+    .slice(0, REPAIR_HISTORY_PROMPT_LIMIT);
+  const omittedCount = Math.max(0, entries.length - selectedEntries.length);
+  const lines = selectedEntries.map(formatFindingMemoryLine);
+
+  if (omittedCount > 0) {
+    lines.push(`- ${omittedCount} older finding record(s) omitted from prompt; see the final report ledger for full history.`);
+  }
+
+  return lines;
+}
+
+function hasPromptWorthyFindingHistory(entry) {
+  return (
+    entry?.status === "fixed" ||
+    entry?.status === "stalled" ||
+    entry?.status === "blocked" ||
+    (Array.isArray(entry?.fixAttempts) && entry.fixAttempts.length > 0) ||
+    (Array.isArray(entry?.appearances) && entry.appearances.length > 1)
+  );
+}
+
+function compareFindingMemoryEntries(left, right) {
+  const leftOpen = left.status === "fixed" ? 0 : 1;
+  const rightOpen = right.status === "fixed" ? 0 : 1;
+  if (leftOpen !== rightOpen) {
+    return rightOpen - leftOpen;
+  }
+
+  return (right.lastSeenRound || 0) - (left.lastSeenRound || 0);
+}
+
+function formatFindingMemoryLine(entry) {
+  const latestAttempt = Array.isArray(entry.fixAttempts) ? entry.fixAttempts.at(-1) : null;
+  const latestSummary = truncateForPrompt(latestAttempt?.summary || entry.fixStrategy || "", 220);
+  const latestReason = truncateForPrompt(latestAttempt?.reason || entry.why || "", 220);
+  return [
+    `- fingerprint=${entry.fingerprint}`,
+    `status=${entry.status || "open"}`,
+    `title=${truncateForPrompt(entry.title || "n/a", 120)}`,
+    `file=${entry.file || "n/a"}`,
+    `first_seen=${entry.firstSeenRound ?? "n/a"}`,
+    `last_seen=${entry.lastSeenRound ?? "n/a"}`,
+    `appearances=${(entry.appearances || []).join(",") || "none"}`,
+    `latest_fix_status=${latestAttempt?.findingStatus || latestAttempt?.fixStatus || "none"}`,
+    `latest_fix_summary=${latestSummary || "n/a"}`,
+    `latest_fix_reason=${latestReason || "n/a"}`,
+  ].join("; ");
 }
 
 function runTests(commands, cwd, outputDir, timeoutMs) {
@@ -1481,6 +1625,7 @@ function updateFindingLedger(ledger, activeFindings, roundNumber) {
         firstSeenRound: roundNumber,
         lastSeenRound: roundNumber,
         appearances: [roundNumber],
+        fixAttempts: [],
         status: "open",
       });
       finding.firstSeenRound = roundNumber;
@@ -1493,6 +1638,240 @@ function updateFindingLedger(ledger, activeFindings, roundNumber) {
     entry.status = "open";
     finding.firstSeenRound = entry.firstSeenRound;
   }
+}
+
+function markResolvedFindingsAfterReview({ ledger, previousRound, currentFindings, roundNumber }) {
+  if (!previousRound) {
+    return;
+  }
+
+  const currentFingerprints = new Set(currentFindings.map((finding) => finding.fingerprint));
+  const previousFindings = [
+    ...(previousRound.activeFindings || []),
+    ...(previousRound.blockedFindings || []),
+  ];
+
+  for (const finding of previousFindings) {
+    if (currentFingerprints.has(finding.fingerprint)) {
+      continue;
+    }
+
+    const entry = ledger.get(finding.fingerprint);
+    if (!entry || entry.status !== "open") {
+      continue;
+    }
+
+    entry.status = "fixed";
+    entry.resolvedRound = roundNumber;
+    entry.resolutionReason = "not reported in the next review round";
+  }
+}
+
+function recordFixAttemptForFindings(ledger, activeFindings, fixResult, roundNumber) {
+  const resultByFingerprint = new Map(
+    getFixFindingResults(fixResult).map((result) => [result.fingerprint, result]),
+  );
+
+  for (const finding of activeFindings) {
+    const entry = ledger.get(finding.fingerprint);
+    if (!entry) {
+      continue;
+    }
+
+    const findingResult = resultByFingerprint.get(finding.fingerprint) || null;
+    entry.fixAttempts = Array.isArray(entry.fixAttempts) ? entry.fixAttempts : [];
+    entry.fixAttempts.push({
+      round: roundNumber,
+      fixStatus: fixResult?.status || "unknown",
+      findingStatus: findingResult?.status || "no_progress",
+      summary: normalizeWhitespace(findingResult?.summary || fixResult?.summary || ""),
+      reason: normalizeWhitespace(findingResult?.reason || ""),
+      changedFiles: Array.isArray(fixResult?.changed_files) ? fixResult.changed_files : [],
+      notes: Array.isArray(fixResult?.notes) ? fixResult.notes : [],
+    });
+  }
+}
+
+function validateFixFindingResults(fixResult, activeFindings, { outputPath, roundNumber, targetCwd }) {
+  const expectedFingerprints = activeFindings.map((finding) => finding.fingerprint);
+  const expectedSet = new Set(expectedFingerprints);
+  const seen = new Set();
+  const duplicates = new Set();
+  const unexpected = [];
+
+  for (const result of getFixFindingResults(fixResult)) {
+    if (seen.has(result.fingerprint)) {
+      duplicates.add(result.fingerprint);
+      continue;
+    }
+
+    seen.add(result.fingerprint);
+    if (!expectedSet.has(result.fingerprint)) {
+      unexpected.push(result.fingerprint);
+    }
+  }
+
+  const missing = expectedFingerprints.filter((fingerprint) => !seen.has(fingerprint));
+  if (missing.length === 0 && duplicates.size === 0 && unexpected.length === 0) {
+    return;
+  }
+
+  fail("Fix round must report exactly one finding_results entry for each active finding.", {
+    errorType: "invalid_fix_finding_results",
+    phase: "fix",
+    round: roundNumber,
+    outputPath,
+    cwd: targetCwd,
+    missing,
+    duplicates: [...duplicates],
+    unexpected,
+  });
+}
+
+function detectStalledRepair({ ledger, activeFindings, previousRound }) {
+  if (!activeFindings || activeFindings.length === 0) {
+    return null;
+  }
+
+  const stalledFindings = [];
+  for (const finding of activeFindings) {
+    const entry = ledger.get(finding.fingerprint);
+    const fixAttempts = Array.isArray(entry?.fixAttempts) ? entry.fixAttempts : [];
+    const latestAttempt = fixAttempts.at(-1);
+    const appearances = Array.isArray(entry?.appearances) ? entry.appearances : [];
+    const latestStatus = latestAttempt?.findingStatus || "";
+    const latestFixStatus = latestAttempt?.fixStatus || "";
+    const repeatedTooOften =
+      fixAttempts.length >= 2 &&
+      appearances.length >= STALLED_FINDING_APPEARANCE_LIMIT;
+    const terminalAttempt =
+      STALLED_FINDING_RESULT_STATUSES.has(latestStatus) ||
+      STALLED_FIX_STATUSES.has(latestFixStatus);
+
+    if (!repeatedTooOften && !terminalAttempt) {
+      continue;
+    }
+
+    stalledFindings.push(buildStalledFindingRecord({
+      finding,
+      entry,
+      reason: terminalAttempt
+        ? `latest fix attempt reported ${latestStatus || latestFixStatus}`
+        : `finding appeared ${appearances.length} time(s) after ${fixAttempts.length} fix attempt(s)`,
+    }));
+  }
+
+  const repeatedSetStall = detectRepeatedActiveSetStall({
+    activeFindings,
+    previousRound,
+    ledger,
+    alreadyStalled: stalledFindings,
+  });
+  stalledFindings.push(...repeatedSetStall);
+
+  if (stalledFindings.length === 0) {
+    return null;
+  }
+
+  return {
+    reason: "repeated-finding-no-progress",
+    findings: stalledFindings,
+  };
+}
+
+function detectNoProgressRepairAfterFix({ activeFindings, fixResult }) {
+  if (!fixResult || !isNoProgressFix(fixResult)) {
+    return null;
+  }
+
+  const resultByFingerprint = new Map(
+    getFixFindingResults(fixResult).map((result) => [result.fingerprint, result]),
+  );
+
+  return {
+    reason: "fix-round-reported-no-progress",
+    findings: activeFindings.map((finding) => ({
+      fingerprint: finding.fingerprint,
+      title: finding.title,
+      file: finding.file,
+      status: resultByFingerprint.get(finding.fingerprint)?.status || fixResult.status || "no_progress",
+      summary: resultByFingerprint.get(finding.fingerprint)?.summary || fixResult.summary || "",
+      reason: resultByFingerprint.get(finding.fingerprint)?.reason || "Fix round made no meaningful code change.",
+      appearances: [],
+      fix_attempts: [],
+    })),
+  };
+}
+
+function detectRepeatedActiveSetStall({ activeFindings, previousRound, ledger, alreadyStalled }) {
+  if (!previousRound?.fix || !isNoProgressFix(previousRound.fix)) {
+    return [];
+  }
+
+  const currentFingerprints = activeFindings.map((finding) => finding.fingerprint).sort();
+  const previousFingerprints = (previousRound.activeFindings || [])
+    .map((finding) => finding.fingerprint)
+    .sort();
+  if (!arraysEqual(currentFingerprints, previousFingerprints)) {
+    return [];
+  }
+
+  const alreadyStalledFingerprints = new Set(alreadyStalled.map((finding) => finding.fingerprint));
+  return activeFindings
+    .filter((finding) => !alreadyStalledFingerprints.has(finding.fingerprint))
+    .map((finding) => buildStalledFindingRecord({
+      finding,
+      entry: ledger.get(finding.fingerprint),
+      reason: "same active finding set reappeared after a no-progress fix round",
+    }));
+}
+
+function buildStalledFindingRecord({ finding, entry, reason }) {
+  return {
+    fingerprint: finding.fingerprint,
+    title: finding.title,
+    file: finding.file,
+    severity: finding.severity,
+    reason,
+    appearances: Array.isArray(entry?.appearances) ? entry.appearances : [],
+    fix_attempts: Array.isArray(entry?.fixAttempts) ? entry.fixAttempts : [],
+  };
+}
+
+function isNoProgressFix(fixResult) {
+  if (!fixResult) {
+    return false;
+  }
+
+  if (STALLED_FIX_STATUSES.has(fixResult.status)) {
+    return true;
+  }
+
+  const findingResults = getFixFindingResults(fixResult);
+  if (findingResults.length > 0 && findingResults.every((result) => (
+    STALLED_FINDING_RESULT_STATUSES.has(result.status)
+  ))) {
+    return true;
+  }
+
+  return (
+    Array.isArray(fixResult.changed_files) &&
+    fixResult.changed_files.length === 0 &&
+    findingResults.length > 0 &&
+    findingResults.every((result) => result.status !== "fixed" && result.status !== "partially_fixed")
+  );
+}
+
+function getFixFindingResults(fixResult) {
+  return Array.isArray(fixResult?.finding_results) ? fixResult.finding_results : [];
+}
+
+function arraysEqual(left, right) {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((value, index) => value === right[index]);
 }
 
 function finalizeFindingLedger(ledger, finalActiveFindings) {
@@ -1568,6 +1947,7 @@ function buildFinalReport(runState) {
         blocked_findings: round.blockedFindings.map(serializeFindingForReport),
         business_questions: round.review.businessQuestions.map(serializeBusinessQuestionForReport),
         new_findings: round.newFindings.map(serializeFindingForReport),
+        stalled_repair: round.stalledRepair || null,
         fix: round.fix,
         tests: round.tests,
       })),
@@ -1582,9 +1962,19 @@ function buildFinalReport(runState) {
       blocked_findings: round.blockedFindings.map(serializeFindingForReport),
       business_questions: round.review.businessQuestions.map(serializeBusinessQuestionForReport),
       new_findings: round.newFindings.map(serializeFindingForReport),
+      stalled_repair: round.stalledRepair || null,
       fix: round.fix,
       tests: round.tests,
     })),
+    stalled_repairs: runState.rounds
+      .filter((round) => round.stalledRepair)
+      .map((round) => ({
+        slice_id: round.sliceId,
+        slice_label: round.sliceLabel,
+        round: round.round,
+        global_round: round.globalRound,
+        ...round.stalledRepair,
+      })),
     remaining_findings: runState.finalActiveFindings.map(serializeFindingForReport),
     business_questions: runState.rounds.flatMap((round) => (
       round.review.businessQuestions.map(serializeBusinessQuestionForReport)
@@ -1613,6 +2003,10 @@ function deriveFinalStatus(stopReason, finalActiveFindings) {
 
   if (stopReason === "no-new-p1p2") {
     return "stopped-with-persistent-findings";
+  }
+
+  if (stopReason === "stalled-repair") {
+    return "stalled-repair";
   }
 
   if (stopReason === "max-rounds") {
@@ -2341,9 +2735,18 @@ function buildSliceDiffPromptLines(slice) {
     return [];
   }
 
+  const omittedFileCount = Math.max(0, slice.diff.files.length - DIFF_PROMPT_FILE_LIMIT);
   const changedFiles = slice.diff.files.length === 0
     ? ["- No changed files were detected for this slice against the resolved base."]
-    : slice.diff.files.map((file) => `- ${file.path} (+${file.insertions}/-${file.deletions})`);
+    : slice.diff.files
+        .slice(0, DIFF_PROMPT_FILE_LIMIT)
+        .map((file) => `- ${file.path} (+${file.insertions}/-${file.deletions})`);
+  const statLines = slice.diff.statText
+    ? slice.diff.statText.split(/\r?\n/).slice(0, DIFF_PROMPT_STAT_LINE_LIMIT)
+    : [];
+  const omittedStatLineCount = slice.diff.statText
+    ? Math.max(0, slice.diff.statText.split(/\r?\n/).length - statLines.length)
+    : 0;
 
   return [
     `- Resolved base ref: ${slice.diff.baseRef}`,
@@ -2352,19 +2755,18 @@ function buildSliceDiffPromptLines(slice) {
     `- Estimated changed lines: +${slice.diff.insertions} / -${slice.diff.deletions}`,
     "- Changed files:",
     ...changedFiles,
-    ...(slice.diff.statText
-      ? ["- Diff stat:", slice.diff.statText]
+    ...(omittedFileCount > 0
+      ? [`- ${omittedFileCount} additional changed file(s) omitted from prompt.`]
       : []),
+    ...(statLines.length > 0
+      ? ["- Diff stat summary:", ...statLines.map((line) => `  ${line}`)]
+      : []),
+    ...(omittedStatLineCount > 0
+      ? [`- ${omittedStatLineCount} additional diff stat line(s) omitted from prompt.`]
+      : []),
+    "- Full patch is intentionally omitted from the prompt; inspect the repository diff directly if needed.",
     ...(slice.diff.patchExcerpt
-      ? [
-          "- Relevant diff patch:",
-          "```diff",
-          slice.diff.patchExcerpt,
-          "```",
-          ...(slice.diff.patchWasTruncated
-            ? ["- The diff patch above was truncated to keep the prompt bounded."]
-            : []),
-        ]
+      ? [`- Patch text was available to the supervisor but is not embedded here. Truncated before omission: ${slice.diff.patchWasTruncated ? "yes" : "no"}.`]
       : []),
   ];
 }
@@ -3179,6 +3581,15 @@ function truncateToLimit(text, limit) {
   };
 }
 
+function truncateForPrompt(text, limit) {
+  const normalized = normalizeWhitespace(text || "");
+  if (normalized.length <= limit) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, Math.max(0, limit - 24)).trimEnd()}... [truncated]`;
+}
+
 function writeJson(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
@@ -3222,13 +3633,21 @@ function isMainModule() {
 export {
   buildBusinessQuestionId,
   buildFindingFingerprint,
+  buildRepairHistoryPromptLines,
   buildResumableSliceMap,
+  buildSliceDiffPromptLines,
+  detectNoProgressRepairAfterFix,
+  detectStalledRepair,
   discoverTestCommands,
   extractGithubActionsRunCommands,
   isLikelyVerificationCommand,
   isPathAllowedByBoundaries,
+  markResolvedFindingsAfterReview,
   normalizeFinding,
+  recordFixAttemptForFindings,
   resolveScopeBaseRef,
+  updateFindingLedger,
+  validateFixFindingResults,
 };
 
 if (isMainModule()) {
