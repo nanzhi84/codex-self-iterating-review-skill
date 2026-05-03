@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   buildBusinessQuestionId,
@@ -24,6 +25,8 @@ import {
   updateFindingLedger,
   validateFixFindingResults,
 } from "./review_loop.mjs";
+
+const REVIEW_LOOP_SCRIPT = fileURLToPath(new URL("./review_loop.mjs", import.meta.url));
 
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "sir-test-"));
@@ -89,6 +92,25 @@ jobs:
     "pnpm run lint",
     "pnpm run typecheck",
   ]);
+});
+
+test("rejects one normal review round because it cannot fix and re-review", () => {
+  assert.throws(
+    () => execFileSync(process.execPath, [
+      REVIEW_LOOP_SCRIPT,
+      "--scope",
+      "Review the current branch diff for concrete correctness issues.",
+      "--max-rounds",
+      "1",
+    ], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }),
+    (error) => {
+      assert.match(error.stdout, /must be at least 2/);
+      return true;
+    },
+  );
 });
 
 test("extracts multi-line GitHub Actions run commands conservatively", () => {

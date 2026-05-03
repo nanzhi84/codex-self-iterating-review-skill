@@ -9,6 +9,8 @@ description: Run a multi-round fresh-context code review loop for a Git reposito
 
 Use this skill when the user wants Codex to keep reviewing the same scoped change set in fresh non-interactive runs, fix current defects, infer mechanical details such as base refs and test commands, and stop only when the scoped code is clean, a finding requires business clarification, repeated repair is no longer making progress, or the loop hits a configured round limit.
 
+When the user explicitly invokes this skill with a clear scope, treat that invocation as approval to run the review/fix loop. Do not ask for a separate plan, execution confirmation, or permission to fix ordinary technical findings. Ask only when the review scope is missing or ambiguous, when a finding requires a product/business decision, or when the requested fix would need to exceed the stated scope boundaries.
+
 This skill delegates the loop to the bundled supervisor script:
 
 ```powershell
@@ -25,12 +27,14 @@ Collect or confirm only these inputs:
 
 - `scope`: required. A concrete sentence that describes exactly what should be reviewed.
 - `test commands`: optional. Use user-provided commands when present; otherwise let the supervisor auto-discover tests from repository metadata.
-- `max rounds`: optional. Default `6`.
+- `max rounds`: optional. Default `6`. Use at least `2` for normal runs so the loop has room to review, fix, and re-review. Do not pass `--max-rounds 1` unless using `--plan-only`.
 - `mode`: optional. Default `auto`. In `auto`, use the current checkout when it is already a linked worktree or has uncommitted changes; otherwise create a detached worktree for a clean main checkout. Use explicit `worktree` only when you want another isolated detached worktree.
 - `test timeout`: optional. Default 30 minutes per test command.
 - `resume run`: optional. Use only when continuing from an earlier artifact directory.
 
 If the user does not provide a clear `scope`, ask one short question before running. Do not infer the review boundary from repository state when the human intent is ambiguous.
+
+Once the scope is clear, do not ask for confirmation just because the review found findings. Concrete findings should move into the fix round automatically. Human confirmation is reserved for ambiguous scope, unclear business semantics, or a requested edit outside the allowed scope.
 
 Do not ask for test commands by default. The supervisor discovers common commands from files such as `package.json`, `pyproject.toml`, `pytest.ini`, `go.mod`, `Cargo.toml`, `.sln`, `Makefile`, `justfile`, and `.github/workflows/*.yml`. If no command is discovered, the loop continues without test verification and records that limitation in the final JSON.
 
@@ -103,12 +107,13 @@ If a finding depends on unclear product policy or business semantics, do not inv
 1. Verify that the target directory is a Git repository.
 2. Build one concrete `--scope` string.
 3. Choose `--mode auto`, `--mode in-place`, or `--mode worktree`; omit it only when the default `auto` behavior is intended.
-4. Pass explicit test commands with `--test` only when the user supplied them or when you have a strong reason to override auto-discovery.
-5. Pass `--allow-support-path` only when a fix may need to edit a small known support area outside the scoped paths.
-6. Optional: use `--plan-only` first when you want to inspect the resolved base and auto-slice plan without launching child Codex runs.
-7. Optional: use `--resume <run-dir>` to continue from a previous `final-report.json` or `failure-report.json`.
-8. Run the script.
-9. Read the final JSON printed to stdout and summarize:
+4. Do not set `--max-rounds 1` for a normal run. A one-round cap can produce a review-only result with active findings but no fix attempt.
+5. Pass explicit test commands with `--test` only when the user supplied them or when you have a strong reason to override auto-discovery.
+6. Pass `--allow-support-path` only when a fix may need to edit a small known support area outside the scoped paths.
+7. Optional: use `--plan-only` first when you want to inspect the resolved base and auto-slice plan without launching child Codex runs.
+8. Optional: use `--resume <run-dir>` to continue from a previous `final-report.json` or `failure-report.json`.
+9. Run the script.
+10. Read the final JSON printed to stdout and summarize:
    - why the loop stopped
    - how many rounds ran
    - which findings were fixed

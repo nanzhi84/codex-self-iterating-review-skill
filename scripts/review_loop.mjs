@@ -8,6 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_MAX_ROUNDS = 6;
+const MIN_FIXING_REVIEW_ROUNDS = 2;
 const MAX_ALLOWED_ROUNDS = 12;
 const DEFAULT_MODE = "auto";
 const DEFAULT_STOP_CONDITION = "current-clean";
@@ -346,6 +347,10 @@ function validateConfig(config) {
     fail(`\`--max-rounds\` must be an integer between 1 and ${MAX_ALLOWED_ROUNDS}.`);
   }
 
+  if (!config.planOnly && config.maxRounds < MIN_FIXING_REVIEW_ROUNDS) {
+    fail(`\`--max-rounds\` must be at least ${MIN_FIXING_REVIEW_ROUNDS} for a normal self-iterating review. Use \`--plan-only\` for a dry run.`);
+  }
+
   if (!["auto", "in-place", "worktree"].includes(config.mode)) {
     fail("`--mode` must be `auto`, `in-place`, or `worktree`.");
   }
@@ -379,7 +384,7 @@ function printHelp() {
     "Options:",
     "  --repo <path>               Repository path (default: current directory)",
     "  --mode <auto|in-place|worktree>  Execution mode (default: auto)",
-    "  --max-rounds <n>            Maximum review rounds (default: 6)",
+    "  --max-rounds <n>            Maximum review rounds (default: 6; minimum 2 unless --plan-only)",
     "  --stop-condition <value>    current-clean or no-new-p1p2",
     "  --base <ref>                Optional explicit diff base ref",
     "  --path <path>               Hard path boundary, repeatable",
@@ -1205,6 +1210,8 @@ async function runCodexStructured({
     "-c",
     `model_reasoning_effort="${DEFAULT_CHILD_REASONING_EFFORT}"`,
     "-c",
+    `approval_policy="never"`,
+    "-c",
     "plugins={}",
     "-c",
     "features.multi_agent=false",
@@ -1373,6 +1380,7 @@ function buildReviewPrompt({
     "- Report only current issues that are still present in this checkout.",
     "- Use historical finding memory to avoid re-reporting a stale issue as new. If a repeated issue is still real, keep the same `dedupe_key` and `fingerprint_basis`.",
     "- Treat previously failed tests as high-priority evidence. If the root cause is in scope, report a finding for it.",
+    "- This non-interactive loop is already approved for the requested scope. Do not ask for a plan, execution confirmation, or approval before reporting technically clear findings.",
     "- Prefer high-confidence findings. Skip speculation.",
     "- Do not run the full project test suite during the review round. Prefer static inspection and minimal targeted commands.",
     "- If a finding depends on unclear product policy or business semantics, set `requires_business_confirmation` to true and write the exact question in `business_question`.",
@@ -1468,6 +1476,7 @@ function buildFixPrompt({
     "",
     "Rules:",
     "- Fix root causes, not symptoms.",
+    "- This fix round is already approved for the active findings. Apply technically clear fixes; do not return `blocked` or `no-op` only because a general coding-before-confirmation instruction exists.",
     "- For every active finding, include exactly one `finding_results` entry using the finding's `fingerprint`.",
     "- In `finding_results`, record what you changed and why the issue is or is not fixed. Use `no_progress` when you cannot make a meaningful change.",
     "- Do not mark a finding as `fixed` unless the root cause was changed. Use `invalid` when the finding is demonstrably false.",
