@@ -29,6 +29,7 @@ Collect or confirm only these inputs:
 - `test commands`: optional. Use user-provided commands when present; otherwise let the supervisor auto-discover tests from repository metadata.
 - `max rounds`: optional. Default `6`. Use at least `2` for normal runs so the loop has room to review, fix, and re-review. Do not pass `--max-rounds 1` unless using `--plan-only`.
 - `mode`: optional. Default `auto`. In `auto`, use the current checkout when it is already a linked worktree or has uncommitted changes; otherwise create a detached worktree for a clean main checkout. Use explicit `worktree` only when you want another isolated detached worktree.
+- `review profile`: optional. Default `auto`. Use `spec` when reviewing product specs, API contracts, RFCs, PRDs, acceptance criteria, or state-machine documents. The supervisor also auto-detects obvious spec paths such as `*_SPEC.md`.
 - `test timeout`: optional. Default 30 minutes per test command.
 - `resume run`: optional. Use only when continuing from an earlier artifact directory.
 
@@ -37,6 +38,8 @@ If the user does not provide a clear `scope`, ask one short question before runn
 Once the scope is clear, do not ask for confirmation just because the review found findings. Concrete findings should move into the fix round automatically. Human confirmation is reserved for ambiguous scope, unclear business semantics, or a requested edit outside the allowed scope.
 
 Do not ask for test commands by default. The supervisor discovers common commands from files such as `package.json`, `pyproject.toml`, `pytest.ini`, `go.mod`, `Cargo.toml`, `.sln`, `Makefile`, `justfile`, and `.github/workflows/*.yml`. If no command is discovered, the loop continues without test verification and records that limitation in the final JSON.
+
+If the user provides prior review comments, pasted findings, QA notes, or external reviewer output, treat them as seed evidence. Include them in the scope or pass them through `--extra-instruction`; the loop must adjudicate each seed finding as fixed, still active, invalid, or requiring business confirmation. Do not rely on a previous clean result when the human has introduced new findings or a stricter review rubric.
 
 ## Scope Rules
 
@@ -102,18 +105,21 @@ Fix all concrete findings regardless of severity. Do not fix style feedback, ref
 
 If a finding depends on unclear product policy or business semantics, do not invent the rule. Mark it as requiring business confirmation, include the exact question, and stop with that question in the final report.
 
+For `spec` review profile, treat the scoped artifact as a contract rather than prose. Missing objective contracts are findings when they can make implementation or QA diverge. Review at least these boundaries before accepting a clean result: state x actor x action transitions, API request/response/empty/error schemas, validation and normalization rules, idempotency and crash recovery, privacy boundaries across all notification channels, crypto/key/nonce parameters, liveness and active-lock behavior, rollout/rollback assumptions, and acceptance criteria mapped to executable tests.
+
 ## Invocation Workflow
 
 1. Verify that the target directory is a Git repository.
 2. Build one concrete `--scope` string.
 3. Choose `--mode auto`, `--mode in-place`, or `--mode worktree`; omit it only when the default `auto` behavior is intended.
-4. Do not set `--max-rounds 1` for a normal run. A one-round cap can produce a review-only result with active findings but no fix attempt.
-5. Pass explicit test commands with `--test` only when the user supplied them or when you have a strong reason to override auto-discovery.
-6. Pass `--allow-support-path` only when a fix may need to edit a small known support area outside the scoped paths.
-7. Optional: use `--plan-only` first when you want to inspect the resolved base and auto-slice plan without launching child Codex runs.
-8. Optional: use `--resume <run-dir>` to continue from a previous `final-report.json` or `failure-report.json`.
-9. Run the script.
-10. Read the final JSON printed to stdout and summarize:
+4. Pass `--review-profile spec` for specs, API contracts, PRDs, RFCs, and acceptance criteria when auto-detection might be ambiguous.
+5. Do not set `--max-rounds 1` for a normal run. A one-round cap can produce a review-only result with active findings but no fix attempt.
+6. Pass explicit test commands with `--test` only when the user supplied them or when you have a strong reason to override auto-discovery.
+7. Pass `--allow-support-path` only when a fix may need to edit a small known support area outside the scoped paths.
+8. Optional: use `--plan-only` first when you want to inspect the resolved base and auto-slice plan without launching child Codex runs.
+9. Optional: use `--resume <run-dir>` to continue from a previous `final-report.json` or `failure-report.json`.
+10. Run the script.
+11. Read the final JSON printed to stdout and summarize:
    - why the loop stopped
    - how many rounds ran
    - which findings were fixed

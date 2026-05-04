@@ -13,6 +13,7 @@ const MAX_ALLOWED_ROUNDS = 12;
 const DEFAULT_MODE = "auto";
 const DEFAULT_STOP_CONDITION = "current-clean";
 const DEFAULT_FOCUS = ["correctness", "regression", "security"];
+const DEFAULT_REVIEW_PROFILE = "auto";
 const DEFAULT_CODEX_TIMEOUT_MS = 60 * 60 * 1000;
 const DEFAULT_TEST_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_CHILD_REASONING_EFFORT = "medium";
@@ -184,7 +185,10 @@ async function runLoop(context) {
     );
   }
 
-  const resumableSlices = buildResumableSliceMap(config.resumeReport);
+  const resumableSlices = buildResumableSliceMap(config.resumeReport, {
+    config,
+    plannedSlices: reviewSlices,
+  });
   for (const slice of reviewSlices) {
     const resumedSlice = resumableSlices.get(slice.id);
     if (resumedSlice) {
@@ -238,7 +242,11 @@ function parseArgs(argv) {
     paths: [],
     allowSupportPaths: [],
     focus: [...DEFAULT_FOCUS],
+    focusProvided: false,
+    reviewProfile: DEFAULT_REVIEW_PROFILE,
+    reviewProfileProvided: false,
     extraInstructions: [],
+    extraInstructionsProvided: false,
     model: "",
     allowNoTests: false,
     autoApplyWorktree: true,
@@ -285,9 +293,15 @@ function parseArgs(argv) {
         break;
       case "--focus":
         config.focus.push(readRequiredValue(argv, ++index, "--focus"));
+        config.focusProvided = true;
+        break;
+      case "--review-profile":
+        config.reviewProfile = readRequiredValue(argv, ++index, "--review-profile");
+        config.reviewProfileProvided = true;
         break;
       case "--extra-instruction":
         config.extraInstructions.push(readRequiredValue(argv, ++index, "--extra-instruction"));
+        config.extraInstructionsProvided = true;
         break;
       case "--model":
         config.model = readRequiredValue(argv, ++index, "--model");
@@ -359,6 +373,10 @@ function validateConfig(config) {
     fail("`--stop-condition` must be either `current-clean` or `no-new-p1p2`.");
   }
 
+  if (!["auto", "code", "spec"].includes(config.reviewProfile)) {
+    fail("`--review-profile` must be `auto`, `code`, or `spec`.");
+  }
+
   if (config.baseRef && !config.baseRef.trim()) {
     fail("`--base` must not be blank.");
   }
@@ -390,6 +408,7 @@ function printHelp() {
     "  --path <path>               Hard path boundary, repeatable",
     "  --allow-support-path <path> Allow fix support edits outside the hard path, repeatable",
     "  --focus <text>              Extra review focus, repeatable",
+    "  --review-profile <value>    auto, code, or spec; spec adds contract and acceptance checklist prompts",
     "  --extra-instruction <text>  Extra instruction for review and fix prompts",
     "  --model <name>              Optional model override for codex exec",
     `  --codex-timeout-ms <ms>     Per-run timeout for codex exec (default: ${DEFAULT_CODEX_TIMEOUT_MS})`,
@@ -428,6 +447,18 @@ function applyResumeDefaults(config) {
 
   if (config.allowSupportPaths.length === 0 && Array.isArray(previousConfig.allow_support_paths)) {
     config.allowSupportPaths = previousConfig.allow_support_paths;
+  }
+
+  if (!config.focusProvided && Array.isArray(previousConfig.focus)) {
+    config.focus = previousConfig.focus;
+  }
+
+  if (!config.reviewProfileProvided && previousConfig.review_profile) {
+    config.reviewProfile = previousConfig.review_profile;
+  }
+
+  if (!config.extraInstructionsProvided && Array.isArray(previousConfig.extra_instructions)) {
+    config.extraInstructions = previousConfig.extra_instructions;
   }
 
   if (!config.baseRef && resumeReport.resolved_base_ref) {
@@ -473,11 +504,15 @@ function parseBusinessAnswer(value) {
   };
 }
 
-function buildResumableSliceMap(resumeReport) {
+function buildResumableSliceMap(resumeReport, options = {}) {
   const result = new Map();
   if (!resumeReport || !Array.isArray(resumeReport.slices)) {
     return result;
   }
+
+  const plannedSlices = Array.isArray(options.plannedSlices) ? options.plannedSlices : [];
+  const plannedSliceById = new Map(plannedSlices.map((slice) => [slice.id, slice]));
+  const shouldCheckResumeCompatibility = Boolean(options.config) && plannedSlices.length > 0;
 
   for (const slice of resumeReport.slices) {
     const finalActiveFindings = Array.isArray(slice.final_active_findings)
@@ -487,12 +522,36 @@ function buildResumableSliceMap(resumeReport) {
       continue;
     }
 
+    let reviewProfile = resolvePreviousSliceReviewProfile(slice, resumeReport);
+    if (shouldCheckResumeCompatibility) {
+      const plannedSlice = plannedSliceById.get(slice.id);
+      if (!plannedSlice) {
+        continue;
+      }
+
+      if (!isSameResumeBoundary(slice, plannedSlice)) {
+        continue;
+      }
+
+      const plannedReviewProfile = plannedSlice.reviewProfile || inferReviewProfile(options.config, plannedSlice);
+      if (!reviewProfile || reviewProfile !== plannedReviewProfile) {
+        continue;
+      }
+
+      if (!isSameResumePromptContract(resumeReport, options.config)) {
+        continue;
+      }
+
+      reviewProfile = plannedReviewProfile;
+    }
+
     result.set(slice.id, {
       id: slice.id,
       label: slice.label,
       scope: slice.scope,
       paths: slice.paths || [],
       baseRef: slice.base_ref ?? null,
+      reviewProfile,
       diff: null,
       stopReason: "clean",
       finalActiveFindings: [],
@@ -502,6 +561,92 @@ function buildResumableSliceMap(resumeReport) {
   }
 
   return result;
+}
+
+function isSameResumePromptContract(resumeReport, config) {
+  const previousConfig = resumeReport?.config || {};
+  const previousFocus = Array.isArray(previousConfig.focus) ? previousConfig.focus : DEFAULT_FOCUS;
+  const previousExtraInstructions = Array.isArray(previousConfig.extra_instructions)
+    ? previousConfig.extra_instructions
+    : [];
+  const currentFocus = Array.isArray(config.focus) ? config.focus : DEFAULT_FOCUS;
+  const currentExtraInstructions = Array.isArray(config.extraInstructions)
+    ? config.extraInstructions
+    : [];
+
+  return (
+    areSamePromptItems(previousFocus, currentFocus) &&
+    areSamePromptItems(previousExtraInstructions, currentExtraInstructions)
+  );
+}
+
+function areSamePromptItems(previousItems, currentItems) {
+  const previousNormalized = normalizePromptContractItems(previousItems);
+  const currentNormalized = normalizePromptContractItems(currentItems);
+
+  return (
+    previousNormalized.length === currentNormalized.length &&
+    previousNormalized.every((item, index) => item === currentNormalized[index])
+  );
+}
+
+function normalizePromptContractItems(items) {
+  return normalizeDistinctStrings(items.map((item) => normalizeWhitespace(item)));
+}
+
+function isSameResumeBoundary(previousSlice, plannedSlice) {
+  const previousBoundary = normalizeResumeBoundary({
+    scope: previousSlice.scope,
+    paths: previousSlice.paths,
+    baseRef: previousSlice.base_ref,
+  });
+  const plannedBoundary = normalizeResumeBoundary({
+    scope: plannedSlice.scope,
+    paths: plannedSlice.paths,
+    baseRef: plannedSlice.baseRef,
+  });
+
+  return (
+    previousBoundary.scope === plannedBoundary.scope &&
+    previousBoundary.baseRef === plannedBoundary.baseRef &&
+    previousBoundary.paths.length === plannedBoundary.paths.length &&
+    previousBoundary.paths.every((pathItem, index) => pathItem === plannedBoundary.paths[index])
+  );
+}
+
+function normalizeResumeBoundary(slice) {
+  return {
+    scope: normalizeWhitespace(slice.scope || ""),
+    paths: normalizeResumeBoundaryPaths(slice.paths),
+    baseRef: normalizeWhitespace(slice.baseRef || ""),
+  };
+}
+
+function normalizeResumeBoundaryPaths(paths) {
+  if (!Array.isArray(paths)) {
+    return [];
+  }
+
+  return normalizeDistinctStrings(paths.map((pathItem) => (
+    toPosixPath(path.normalize(String(pathItem || "").trim())).replace(/\/+$/, "")
+  ))).sort((left, right) => left.localeCompare(right));
+}
+
+function resolvePreviousSliceReviewProfile(slice, resumeReport) {
+  if (["code", "spec"].includes(slice?.review_profile)) {
+    return slice.review_profile;
+  }
+
+  const runProfile = resumeReport?.config?.review_profile;
+  if (["code", "spec"].includes(runProfile)) {
+    return runProfile;
+  }
+
+  if (runProfile === "auto") {
+    return null;
+  }
+
+  return "code";
 }
 
 function resolveTestPlan(config, repoRoot) {
@@ -1051,6 +1196,7 @@ async function runSliceLoop({ config, runState, slice }) {
     scope: slice.scope,
     paths: slice.paths,
     baseRef: slice.baseRef,
+    reviewProfile: slice.reviewProfile || inferReviewProfile(config, slice),
     diff: slice.diff,
     stopReason: stopReason || "max-rounds",
     finalActiveFindings,
@@ -1340,6 +1486,8 @@ function buildReviewPrompt({
   const diffContextLines = buildSliceDiffPromptLines(slice);
   const failedTestLines = buildFailedTestPromptLines(previousFailedTests);
   const repairHistoryLines = buildRepairHistoryPromptLines(findingLedger);
+  const reviewProfile = inferReviewProfile(config, slice);
+  const reviewProfileLines = buildReviewProfilePromptLines(reviewProfile);
 
   return [
     `You are running review round ${roundNumber} inside a self-iterating review loop.`,
@@ -1359,6 +1507,9 @@ function buildReviewPrompt({
     "",
     "Primary review focus:",
     ...focusLines,
+    "",
+    "Review profile:",
+    ...reviewProfileLines,
     "",
     "Severity rubric:",
     "- P1: severe incorrectness, data loss or corruption, security or privilege breakage, release-blocking defects.",
@@ -1439,6 +1590,8 @@ function buildFixPrompt({
   const diffContextLines = buildSliceDiffPromptLines(slice);
   const failedTestLines = buildFailedTestPromptLines(previousFailedTests);
   const repairHistoryLines = buildRepairHistoryPromptLines(findingLedger);
+  const reviewProfile = inferReviewProfile(config, slice);
+  const fixProfileLines = buildFixProfilePromptLines(reviewProfile);
 
   return [
     `You are fixing the output of review round ${roundNumber} in a self-iterating review loop.`,
@@ -1446,6 +1599,7 @@ function buildFixPrompt({
     "",
     "Goal:",
     "Apply the smallest safe code changes that eliminate the listed active findings.",
+    ...fixProfileLines,
     "",
     "Scope:",
     slice.scope,
@@ -1492,6 +1646,121 @@ function buildFixPrompt({
       ? ["", "Extra instructions:", ...extraInstructionLines]
       : []),
   ].join("\n");
+}
+
+function inferReviewProfile(config, slice) {
+  if (config.reviewProfile && config.reviewProfile !== "auto") {
+    return config.reviewProfile;
+  }
+
+  const paths = Array.isArray(slice.paths) ? slice.paths : [];
+  if (paths.some((pathItem) => isObviousSpecPath(pathItem))) {
+    return "spec";
+  }
+
+  const hasExplicitSpecScope = isExplicitSpecScope(slice.scope) || isExplicitSpecScope(config.scope);
+  if (hasExplicitSpecScope && paths.length > 0 && paths.every((pathItem) => isSpecScopePath(pathItem))) {
+    return "spec";
+  }
+
+  if (paths.length > 0) {
+    return "code";
+  }
+
+  const scopePaths = extractScopePathCandidates([slice.scope, config.scope]);
+  if (scopePaths.some((pathItem) => isObviousSpecPath(pathItem))) {
+    return "spec";
+  }
+
+  if (hasExplicitSpecScope) {
+    return "spec";
+  }
+
+  return "code";
+}
+
+function extractScopePathCandidates(scopeItems) {
+  const candidates = [];
+  const pathLikeDocumentPattern = /[A-Za-z0-9_.()[\]\-\\/]+\.(?:md|mdx|rst|adoc)\b/g;
+
+  for (const scopeItem of scopeItems) {
+    const scopeText = String(scopeItem || "");
+    for (const match of scopeText.matchAll(pathLikeDocumentPattern)) {
+      candidates.push(match[0]);
+    }
+  }
+
+  return candidates;
+}
+
+function isObviousSpecPath(pathItem) {
+  const normalizedPath = String(pathItem || "").replace(/\\/g, "/").toLowerCase();
+  const fileName = path.posix.basename(normalizedPath);
+
+  if (!/\.(?:md|mdx|rst|adoc)$/.test(fileName)) {
+    return false;
+  }
+
+  return (
+    /(?:^|[_-])spec\.(?:md|mdx|rst|adoc)$/.test(fileName) ||
+    /^(?:prd|rfc|adr)(?:[._-].*)?\.(?:md|mdx|rst|adoc)$/.test(fileName) ||
+    /(?:^|[_-])(?:contract|acceptance[-_]criteria)\.(?:md|mdx|rst|adoc)$/.test(fileName)
+  );
+}
+
+function isSpecScopePath(pathItem) {
+  const normalizedPath = String(pathItem || "")
+    .replace(/\\/g, "/")
+    .toLowerCase()
+    .replace(/\/+$/, "");
+  const fileName = path.posix.basename(normalizedPath);
+
+  if (/\.(?:md|mdx|rst|adoc)$/.test(fileName)) {
+    return true;
+  }
+
+  return /^(?:docs?|documentation|specs?|specifications?|contracts?|rfcs?|prds?|adrs?|requirements)$/.test(fileName);
+}
+
+function isExplicitSpecScope(scope) {
+  const normalizedScope = String(scope || "").toLowerCase();
+
+  return (
+    /\b(?:product|engineering|technical|api|shared)\s+(?:spec|specification|contract)\b/.test(normalizedScope) ||
+    /\b(?:spec|specification|contract)\s+(?:document|doc|review|rubric)\b/.test(normalizedScope) ||
+    /\b(?:prd|rfc|adr)\s+(?:document|doc|review|rubric|spec|specification)\b/.test(normalizedScope) ||
+    /\b(?:document|doc|review|rubric|spec|specification)\s+(?:prd|rfc|adr)\b/.test(normalizedScope) ||
+    /\bacceptance[-\s]?criteria\b/.test(normalizedScope) ||
+    /\bstate[-\s]?machine\s+document\b/.test(normalizedScope) ||
+    /\brequirements?\s+(?:document|doc|contract|specification)\b/.test(normalizedScope)
+  );
+}
+
+function buildReviewProfilePromptLines(reviewProfile) {
+  if (reviewProfile !== "spec") {
+    return [
+      "- code",
+      "- Treat the scoped files as implementation code unless the scope explicitly says otherwise.",
+    ];
+  }
+
+  return [
+    "- spec",
+    "- Treat the scoped files as engineering/product contracts, not prose. Missing objective contracts are findings when they can make API, UI, schema, tests, rollout, security, privacy, or operations diverge.",
+    "- Do a checklist pass before declaring the scope clean. In `round_summary`, mention any checklist area that is not applicable.",
+    "- Checklist: liveness and active locks; state x actor x action transition table; side effects for each action including fields, audit, notifications, cooldowns, and snapshots; request/response/empty-state/error schemas; idempotency and crash recovery; privacy boundaries including all notification channels; validation, normalization, and display rules; crypto/key/nonce parameters; acceptance criteria mapped to executable tests.",
+    "- For product-policy choices, report a business question instead of inventing semantics. For mechanical omissions, report a concrete finding.",
+  ];
+}
+
+function buildFixProfilePromptLines(reviewProfile) {
+  if (reviewProfile !== "spec") {
+    return [];
+  }
+
+  return [
+    "For spec-profile findings, fix by tightening the scoped specification contract: add concrete schemas, matrices, validation rules, side effects, or acceptance criteria as needed. Do not invent product policy; mark it blocked when the finding needs a business decision.",
+  ];
 }
 
 function buildFailedTestPromptLines(failedTests) {
@@ -1926,6 +2195,7 @@ function buildFinalReport(runState) {
       paths: runState.config.paths,
       allow_support_paths: runState.config.allowSupportPaths,
       focus: runState.config.focus,
+      review_profile: runState.config.reviewProfile,
       extra_instructions: runState.config.extraInstructions,
       model: runState.config.model || null,
       search: runState.config.search,
@@ -1939,28 +2209,7 @@ function buildFinalReport(runState) {
     rounds_executed: runState.rounds.length,
     baseline_tests: runState.baselineTests,
     slice_plan: runState.slicePlan,
-    slices: runState.slices.map((slice) => ({
-      id: slice.id,
-      label: slice.label,
-      scope: slice.scope,
-      base_ref: slice.baseRef,
-      paths: slice.paths,
-      resumed_from: slice.resumedFrom ?? null,
-      stop_reason: slice.stopReason,
-      final_active_findings: slice.finalActiveFindings.map(serializeFindingForReport),
-      rounds: slice.rounds.map((round) => ({
-        round: round.round,
-        global_round: round.globalRound,
-        review_summary: round.review.roundSummary,
-        active_findings: round.activeFindings.map(serializeFindingForReport),
-        blocked_findings: round.blockedFindings.map(serializeFindingForReport),
-        business_questions: round.review.businessQuestions.map(serializeBusinessQuestionForReport),
-        new_findings: round.newFindings.map(serializeFindingForReport),
-        stalled_repair: round.stalledRepair || null,
-        fix: round.fix,
-        tests: round.tests,
-      })),
-    })),
+    slices: runState.slices.map(serializeSliceForReport),
     rounds: runState.rounds.map((round) => ({
       slice_id: round.sliceId,
       slice_label: round.sliceLabel,
@@ -1994,6 +2243,32 @@ function buildFinalReport(runState) {
       currently_active: finalActiveFingerprints.has(entry.fingerprint),
     })),
     artifact_paths: runState.artifactPaths,
+  };
+}
+
+function serializeSliceForReport(slice) {
+  return {
+    id: slice.id,
+    label: slice.label,
+    scope: slice.scope,
+    base_ref: slice.baseRef,
+    review_profile: slice.reviewProfile || null,
+    paths: slice.paths,
+    resumed_from: slice.resumedFrom ?? null,
+    stop_reason: slice.stopReason,
+    final_active_findings: slice.finalActiveFindings.map(serializeFindingForReport),
+    rounds: slice.rounds.map((round) => ({
+      round: round.round,
+      global_round: round.globalRound,
+      review_summary: round.review.roundSummary,
+      active_findings: round.activeFindings.map(serializeFindingForReport),
+      blocked_findings: round.blockedFindings.map(serializeFindingForReport),
+      business_questions: round.review.businessQuestions.map(serializeBusinessQuestionForReport),
+      new_findings: round.newFindings.map(serializeFindingForReport),
+      stalled_repair: round.stalledRepair || null,
+      fix: round.fix,
+      tests: round.tests,
+    })),
   };
 }
 
@@ -2222,7 +2497,7 @@ function buildFailureReport(error, runState) {
     test_plan: runState?.config?.testPlan ?? null,
     baseline_tests: runState?.baselineTests ?? [],
     slice_plan: runState?.slicePlan ?? [],
-    slices: runState?.slices ?? [],
+    slices: runState?.slices.map(serializeSliceForReport) ?? [],
     rounds: runState?.rounds.map((roundRecord) => ({
       slice_id: roundRecord.sliceId ?? null,
       slice_label: roundRecord.sliceLabel ?? null,
@@ -2253,6 +2528,7 @@ function serializeRunConfig(config) {
     paths: config.paths,
     allow_support_paths: config.allowSupportPaths,
     focus: config.focus,
+    review_profile: config.reviewProfile,
     extra_instructions: config.extraInstructions,
     model: config.model || null,
     search: config.search,
@@ -2579,7 +2855,7 @@ function buildSingleSlice({
       ? config.scope.trim()
       : `${config.scope.trim()} Auto-slice ${sliceIndex + 1}/${sliceCount}: review only ${label}.`;
 
-  return {
+  const slice = {
     id,
     label,
     scope,
@@ -2591,6 +2867,11 @@ function buildSingleSlice({
       paths,
       diffFiles,
     }),
+  };
+
+  return {
+    ...slice,
+    reviewProfile: inferReviewProfile(config, slice),
   };
 }
 
@@ -2786,6 +3067,7 @@ function serializeSlicePlan(slice) {
     label: slice.label,
     scope: slice.scope,
     base_ref: slice.baseRef,
+    review_profile: slice.reviewProfile || null,
     paths: slice.paths,
     diff: slice.diff
       ? {
@@ -2828,6 +3110,7 @@ function buildPlanOnlyReport(runState) {
       paths: runState.config.paths,
       allow_support_paths: runState.config.allowSupportPaths,
       focus: runState.config.focus,
+      review_profile: runState.config.reviewProfile,
       extra_instructions: runState.config.extraInstructions,
       model: runState.config.model || null,
       search: runState.config.search,
@@ -3641,18 +3924,22 @@ function isMainModule() {
 
 export {
   buildBusinessQuestionId,
+  buildFailureReport,
   buildFindingFingerprint,
   buildRepairHistoryPromptLines,
   buildResumableSliceMap,
+  buildReviewPrompt,
   buildSliceDiffPromptLines,
   detectNoProgressRepairAfterFix,
   detectStalledRepair,
   discoverTestCommands,
   extractGithubActionsRunCommands,
+  inferReviewProfile,
   isLikelyVerificationCommand,
   isPathAllowedByBoundaries,
   markResolvedFindingsAfterReview,
   normalizeFinding,
+  parseArgs,
   recordFixAttemptForFindings,
   resolveScopeBaseRef,
   updateFindingLedger,

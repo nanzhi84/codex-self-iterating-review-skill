@@ -8,18 +8,22 @@ import { fileURLToPath } from "node:url";
 
 import {
   buildBusinessQuestionId,
+  buildFailureReport,
   buildFindingFingerprint,
   buildRepairHistoryPromptLines,
   buildResumableSliceMap,
+  buildReviewPrompt,
   buildSliceDiffPromptLines,
   detectNoProgressRepairAfterFix,
   detectStalledRepair,
   discoverTestCommands,
   extractGithubActionsRunCommands,
+  inferReviewProfile,
   isLikelyVerificationCommand,
   isPathAllowedByBoundaries,
   markResolvedFindingsAfterReview,
   normalizeFinding,
+  parseArgs,
   recordFixAttemptForFindings,
   resolveScopeBaseRef,
   updateFindingLedger,
@@ -131,6 +135,193 @@ jobs:
   assert.equal(isLikelyVerificationCommand("docker build ."), false);
 });
 
+test("infers spec review profile for specification scopes and injects checklist", () => {
+  const config = {
+    scope: "Review ICEBREAKER_SPEC.md for PR1-ready shared contract and QA acceptance criteria.",
+    paths: ["ICEBREAKER_SPEC.md"],
+    focus: ["correctness"],
+    reviewProfile: "auto",
+    extraInstructions: [],
+    businessAnswers: {},
+  };
+  const slice = {
+    scope: config.scope,
+    paths: config.paths,
+    diff: null,
+  };
+
+  assert.equal(inferReviewProfile(config, slice), "spec");
+
+  const prompt = buildReviewPrompt({
+    config,
+    slice,
+    roundNumber: 1,
+    globalRoundNumber: 1,
+    previousFailedTests: [],
+    findingLedger: new Map(),
+  });
+
+  assert.match(prompt, /Review profile:\n- spec/);
+  assert.match(prompt, /state x actor x action transition table/);
+  assert.match(prompt, /request\/response\/empty-state\/error schemas/);
+  assert.match(prompt, /acceptance criteria mapped to executable tests/);
+});
+
+test("auto review profile does not treat common code paths as specs", () => {
+  const config = {
+    scope: "Review implementation and tests for concrete correctness issues.",
+    reviewProfile: "auto",
+  };
+
+  assert.equal(inferReviewProfile(config, {
+    scope: config.scope,
+    paths: ["tests/foo.spec.ts"],
+  }), "code");
+
+  assert.equal(inferReviewProfile(config, {
+    scope: config.scope,
+    paths: ["requirements.txt"],
+  }), "code");
+
+  assert.equal(inferReviewProfile({
+    scope: "Review tests/foo.spec.ts for concrete correctness issues.",
+    reviewProfile: "auto",
+  }, {
+    scope: "Review tests/foo.spec.ts for concrete correctness issues.",
+    paths: [],
+  }), "code");
+
+  assert.equal(inferReviewProfile({
+    scope: "Review requirements.txt for dependency changes.",
+    reviewProfile: "auto",
+  }, {
+    scope: "Review requirements.txt for dependency changes.",
+    paths: [],
+  }), "code");
+
+  for (const codePath of ["src/adr.ts", "src/rfc.ts", "src/prd.ts"]) {
+    assert.equal(inferReviewProfile({
+      scope: `Review ${codePath} for concrete correctness issues.`,
+      reviewProfile: "auto",
+    }, {
+      scope: `Review ${codePath} for concrete correctness issues.`,
+      paths: [codePath],
+    }), "code");
+  }
+});
+
+test("auto review profile keeps code slices on code profile in mixed spec scopes", () => {
+  const config = {
+    scope: "Review API contract and implementation changes for correctness.",
+    reviewProfile: "auto",
+  };
+
+  assert.equal(inferReviewProfile(config, {
+    scope: config.scope,
+    paths: ["src/api.ts"],
+  }), "code");
+
+  assert.equal(inferReviewProfile(config, {
+    scope: config.scope,
+    paths: ["API_CONTRACT.md"],
+  }), "spec");
+});
+
+test("auto review profile treats explicit spec scopes with spec directories as spec", () => {
+  const config = {
+    scope: "Review product spec document under docs/specs for contract gaps.",
+    reviewProfile: "auto",
+  };
+
+  assert.equal(inferReviewProfile(config, {
+    scope: config.scope,
+    paths: ["docs/specs"],
+  }), "spec");
+
+  assert.equal(inferReviewProfile(config, {
+    scope: config.scope,
+    paths: ["src/api.ts"],
+  }), "code");
+});
+
+test("infers spec review profile from obvious spec filenames in scope text", () => {
+  const config = {
+    scope: "Review ICEBREAKER_SPEC.md for concrete defects.",
+    reviewProfile: "auto",
+  };
+
+  assert.equal(inferReviewProfile(config, {
+    scope: config.scope,
+    paths: [],
+  }), "spec");
+});
+
+test("resume keeps an explicit auto review profile instead of inheriting the previous run", () => {
+  const resumeDir = makeTempDir();
+  writeFile(path.join(resumeDir, "final-report.json"), JSON.stringify({
+    config: {
+      scope: "Review previous scope.",
+      review_profile: "spec",
+    },
+  }));
+
+  const resumedConfig = parseArgs([
+    "--resume", resumeDir,
+    "--scope", "Review src/foo.ts for concrete correctness issues.",
+    "--path", "src/foo.ts",
+    "--review-profile", "auto",
+  ]);
+
+  assert.equal(resumedConfig.reviewProfile, "auto");
+  assert.equal(inferReviewProfile(resumedConfig, {
+    scope: resumedConfig.scope,
+    paths: resumedConfig.paths,
+  }), "code");
+});
+
+test("resume keeps explicit auto review profile after a previous code run", () => {
+  const resumeDir = makeTempDir();
+  writeFile(path.join(resumeDir, "final-report.json"), JSON.stringify({
+    config: {
+      scope: "Review previous scope.",
+      review_profile: "code",
+    },
+  }));
+
+  const resumedConfig = parseArgs([
+    "--resume", resumeDir,
+    "--scope", "Review API_CONTRACT.md for missing acceptance criteria.",
+    "--path", "API_CONTRACT.md",
+    "--review-profile", "auto",
+  ]);
+
+  assert.equal(resumedConfig.reviewProfile, "auto");
+  assert.equal(inferReviewProfile(resumedConfig, {
+    scope: resumedConfig.scope,
+    paths: resumedConfig.paths,
+  }), "spec");
+});
+
+test("resume inherits prompt contract inputs when they are not overridden", () => {
+  const resumeDir = makeTempDir();
+  writeFile(path.join(resumeDir, "final-report.json"), JSON.stringify({
+    config: {
+      scope: "Review src/api.ts.",
+      paths: ["src/api.ts"],
+      focus: ["correctness", "regression", "seed findings"],
+      review_profile: "code",
+      extra_instructions: ["Re-check pasted QA findings as seed evidence."],
+    },
+  }));
+
+  const resumedConfig = parseArgs([
+    "--resume", resumeDir,
+  ]);
+
+  assert.deepEqual(resumedConfig.focus, ["correctness", "regression", "seed findings"]);
+  assert.deepEqual(resumedConfig.extraInstructions, ["Re-check pasted QA findings as seed evidence."]);
+});
+
 test("infers origin/main for current branch diff scope", () => {
   const repoRoot = makeTempDir();
   runGit(repoRoot, ["init", "-b", "main"]);
@@ -220,6 +411,272 @@ test("business question ids and resume slice reuse are stable", () => {
 
   assert.equal(resumable.has("slice-01"), true);
   assert.equal(resumable.has("slice-02"), false);
+});
+
+test("resume does not reuse a clean slice when the effective review profile changes", () => {
+  const previousReport = {
+    run_id: "previous",
+    config: {
+      review_profile: "code",
+    },
+    slices: [
+      {
+        id: "slice-01",
+        label: "spec",
+        scope: "Review API_SPEC.md.",
+        paths: ["API_SPEC.md"],
+        stop_reason: "clean",
+        final_active_findings: [],
+      },
+    ],
+  };
+  const plannedSlice = {
+    id: "slice-01",
+    label: "spec",
+    scope: "Review API_SPEC.md.",
+    paths: ["API_SPEC.md"],
+    reviewProfile: "spec",
+  };
+
+  const resumable = buildResumableSliceMap(previousReport, {
+    config: { reviewProfile: "spec", scope: "Review API_SPEC.md." },
+    plannedSlices: [plannedSlice],
+  });
+
+  assert.equal(resumable.has("slice-01"), false);
+});
+
+test("resume does not reuse a clean slice when the reviewed boundary changes", () => {
+  const previousReport = {
+    run_id: "previous",
+    config: {
+      review_profile: "code",
+    },
+    slices: [
+      {
+        id: "slice-01",
+        label: "docs",
+        scope: "Review README.md.",
+        paths: ["README.md"],
+        base_ref: "origin/main",
+        review_profile: "code",
+        stop_reason: "clean",
+        final_active_findings: [],
+      },
+    ],
+  };
+
+  assert.equal(buildResumableSliceMap(previousReport, {
+    config: { reviewProfile: "code", scope: "Review SKILL.md." },
+    plannedSlices: [{
+      id: "slice-01",
+      label: "docs",
+      scope: "Review SKILL.md.",
+      paths: ["SKILL.md"],
+      baseRef: "origin/main",
+      reviewProfile: "code",
+    }],
+  }).has("slice-01"), false);
+
+  assert.equal(buildResumableSliceMap(previousReport, {
+    config: { reviewProfile: "code", scope: "Review README.md." },
+    plannedSlices: [{
+      id: "slice-01",
+      label: "docs",
+      scope: "Review README.md.",
+      paths: ["README.md"],
+      baseRef: "HEAD~1",
+      reviewProfile: "code",
+    }],
+  }).has("slice-01"), false);
+});
+
+test("resume does not reuse a clean slice when extra instructions change", () => {
+  const previousReport = {
+    run_id: "previous",
+    config: {
+      focus: ["correctness", "regression", "security"],
+      review_profile: "code",
+      extra_instructions: [],
+    },
+    slices: [
+      {
+        id: "slice-01",
+        label: "api",
+        scope: "Review src/api.ts.",
+        paths: ["src/api.ts"],
+        base_ref: "origin/main",
+        review_profile: "code",
+        stop_reason: "clean",
+        final_active_findings: [],
+      },
+    ],
+  };
+
+  const resumable = buildResumableSliceMap(previousReport, {
+    config: {
+      focus: ["correctness", "regression", "security"],
+      reviewProfile: "code",
+      extraInstructions: ["Re-check pasted QA findings as seed evidence."],
+      scope: "Review src/api.ts.",
+    },
+    plannedSlices: [{
+      id: "slice-01",
+      label: "api",
+      scope: "Review src/api.ts.",
+      paths: ["src/api.ts"],
+      baseRef: "origin/main",
+      reviewProfile: "code",
+    }],
+  });
+
+  assert.equal(resumable.has("slice-01"), false);
+});
+
+test("resume does not reuse a clean slice when review focus changes", () => {
+  const previousReport = {
+    run_id: "previous",
+    config: {
+      focus: ["correctness", "regression", "security"],
+      review_profile: "code",
+      extra_instructions: [],
+    },
+    slices: [
+      {
+        id: "slice-01",
+        label: "api",
+        scope: "Review src/api.ts.",
+        paths: ["src/api.ts"],
+        base_ref: "origin/main",
+        review_profile: "code",
+        stop_reason: "clean",
+        final_active_findings: [],
+      },
+    ],
+  };
+
+  const resumable = buildResumableSliceMap(previousReport, {
+    config: {
+      focus: ["correctness", "regression", "security", "prompt-contract regressions"],
+      reviewProfile: "code",
+      extraInstructions: [],
+      scope: "Review src/api.ts.",
+    },
+    plannedSlices: [{
+      id: "slice-01",
+      label: "api",
+      scope: "Review src/api.ts.",
+      paths: ["src/api.ts"],
+      baseRef: "origin/main",
+      reviewProfile: "code",
+    }],
+  });
+
+  assert.equal(resumable.has("slice-01"), false);
+});
+
+test("resume reuses a clean slice when the effective review profile is unchanged", () => {
+  const previousReport = {
+    run_id: "previous",
+    config: {
+      review_profile: "spec",
+    },
+    slices: [
+      {
+        id: "slice-01",
+        label: "spec",
+        scope: "Review API_SPEC.md.",
+        paths: ["API_SPEC.md"],
+        review_profile: "spec",
+        stop_reason: "clean",
+        final_active_findings: [],
+      },
+    ],
+  };
+  const plannedSlice = {
+    id: "slice-01",
+    label: "spec",
+    scope: "Review API_SPEC.md.",
+    paths: ["API_SPEC.md"],
+    reviewProfile: "spec",
+  };
+
+  const resumable = buildResumableSliceMap(previousReport, {
+    config: { reviewProfile: "spec", scope: "Review API_SPEC.md." },
+    plannedSlices: [plannedSlice],
+  });
+
+  assert.equal(resumable.has("slice-01"), true);
+  assert.equal(resumable.get("slice-01").reviewProfile, "spec");
+});
+
+test("failure reports serialize clean slices in a resumable shape", () => {
+  const failureReport = buildFailureReport(new Error("review failed"), {
+    runId: "failed-run",
+    repoName: "repo",
+    repoRoot: "/repo",
+    targetCwd: "/repo",
+    worktreePath: "/repo",
+    resolvedBaseRef: "origin/main",
+    baseResolution: null,
+    rounds: [],
+    config: {
+      scope: "Review README.md.",
+      requestedMode: "fresh-worktree",
+      mode: "fresh-worktree",
+      baseRef: "origin/main",
+      maxRounds: 2,
+      stopCondition: "no-new-p1p2",
+      tests: [],
+      testPlan: null,
+      testTimeoutMs: 120000,
+      paths: ["README.md"],
+      allowSupportPaths: [],
+      focus: [],
+      reviewProfile: "code",
+      extraInstructions: [],
+      search: true,
+      allowNoTests: false,
+      autoApplyWorktree: false,
+      businessAnswers: {},
+      planOnly: false,
+    },
+    artifactPaths: {},
+    baselineTests: [],
+    slicePlan: [],
+    slices: [{
+      id: "slice-01",
+      label: "docs",
+      scope: "Review README.md.",
+      baseRef: "origin/main",
+      reviewProfile: "code",
+      paths: ["README.md"],
+      resumedFrom: null,
+      stopReason: "clean",
+      finalActiveFindings: [],
+      rounds: [],
+    }],
+  });
+
+  const resumable = buildResumableSliceMap(failureReport, {
+    config: {
+      focus: [],
+      reviewProfile: "code",
+      extraInstructions: [],
+      scope: "Review README.md.",
+    },
+    plannedSlices: [{
+      id: "slice-01",
+      label: "docs",
+      scope: "Review README.md.",
+      paths: ["README.md"],
+      baseRef: "origin/main",
+      reviewProfile: "code",
+    }],
+  });
+
+  assert.equal(failureReport.slices[0].stop_reason, "clean");
+  assert.equal(resumable.has("slice-01"), true);
 });
 
 test("repair history records per-finding fix outcomes for later rounds", () => {

@@ -90,6 +90,7 @@ node "<skill-dir>/scripts/review_loop.mjs" \
 - `--mode auto|in-place|worktree`: choose automatic behavior, the current checkout, or a detached worktree; default is `auto`
 - `--max-rounds`: upper bound for the loop
 - `--stop-condition current-clean|no-new-p1p2`: choose the stop rule
+- `--review-profile auto|code|spec`: choose the review rubric; `spec` adds a contract and acceptance checklist for specs, API contracts, RFCs, PRDs, and acceptance criteria
 - `--allow-no-tests`: allow a no-test run only when explicitly desired
 - `--codex-timeout-ms`: per-run timeout for each fresh Codex session
 - `--test-timeout-ms`: per-command test timeout; default is 30 minutes
@@ -121,3 +122,5 @@ The core requirement behind this skill is not “review repeatedly” in the sam
 Review runs are expected to inspect code without changing it. The supervisor compares the workspace before and after review using staged and unstaged diffs plus untracked file metadata and hashes, so already-dirty files are still protected from accidental review edits.
 
 This repository intentionally keeps the skill small. The supervisor script uses only Node.js built-ins and delegates code understanding and code edits to Codex itself. It does not invent product policy: findings that require business confirmation are reported as questions instead of being automatically fixed.
+
+Spec and contract reviews need a stricter rubric than ordinary code review. When `--review-profile spec` is active, or when `auto` detects an obvious specification scope such as `*_SPEC.md`, review prompts require a checklist pass over state transitions, actor/action permissions, API schemas, validation rules, notification privacy, crypto/key parameters, idempotency recovery, liveness/lock behavior, and acceptance criteria. A clean result means no current finding was found under that rubric; it is not a mathematical proof that a later broader rubric cannot find new issues.
